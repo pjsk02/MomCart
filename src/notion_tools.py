@@ -74,6 +74,193 @@ def _require(tools: dict, name: str):
     return tools[name]
 
 
+# ── cart operations ────────────────────────────────────────────────────────────
+
+async def add_to_cart(items: List, cart_id: str) -> list[str]:
+    """Add items to Notion with Status='cart'. Returns list of created page IDs."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    create = _require(tools, "API-post-page")
+
+    page_ids: list[str] = []
+    errors = 0
+
+    for item in items:
+        payload = {
+            "parent": {"database_id": settings.NOTION_DATABASE_ID},
+            "properties": {
+                "Item": {
+                    "title": [{"text": {"content": item.name_en}}]
+                },
+                "Qty": {"number": item.qty},
+                "Unit": {"select": {"name": item.unit}},
+                "Status": {"select": {"name": "cart"}},
+                "OrderID": {
+                    "rich_text": [{"text": {"content": cart_id}}]
+                },
+            },
+        }
+        try:
+            result = await create.ainvoke(payload)
+            _raise_if_error(result, f"add_to_cart for {item.name_en!r}")
+            # extract page_id from response
+            page_id = None
+            if isinstance(result, list):
+                for block in result:
+                    if isinstance(block, dict) and "text" in block:
+                        try:
+                            data = json.loads(block["text"])
+                            page_id = data.get("id")
+                        except json.JSONDecodeError:
+                            pass
+            if page_id:
+                page_ids.append(page_id)
+            logger.info(f"Cart row created: {item.name_en} (cart {cart_id})")
+        except Exception as e:
+            errors += 1
+            logger.error(f"Cart add failed for {item.name_en!r}: {e}")
+            if errors >= 2:
+                raise RuntimeError(
+                    f"Cart push aborted after 2 consecutive errors. Last: {e}"
+                )
+
+    return page_ids
+
+
+async def get_cart_items(cart_id: str) -> list[dict]:
+    """Return raw Notion page dicts for all Status='cart' rows under cart_id."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {
+                "and": [
+                    {"property": "OrderID", "rich_text": {"equals": cart_id}},
+                    {"property": "Status", "select": {"equals": "cart"}},
+                ]
+            },
+        })
+    except Exception as e:
+        logger.error(f"get_cart_items failed (cart_id={cart_id}): {e}")
+        raise
+
+    pages = result if isinstance(result, list) else result.get("results", [])
+    # unwrap MCP text blocks if needed
+    if pages and isinstance(pages[0], dict) and "text" in pages[0]:
+        try:
+            data = json.loads(pages[0]["text"])
+            pages = data.get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    return pages
+
+
+async def send_cart(cart_id: str) -> str:
+    """Flip all Status='cart' rows for cart_id to Status='pending'. Returns order_id (same as cart_id)."""
+    tools = await _get_tools()
+    patch = _require(tools, "API-patch-page")
+
+    pages = await get_cart_items(cart_id)
+    if not pages:
+        raise RuntimeError(f"No cart items found for cart_id={cart_id}")
+
+    errors = 0
+    for page in pages:
+        page_id = page.get("id") if isinstance(page, dict) else None
+        if not page_id:
+            continue
+        try:
+            result = await patch.ainvoke({
+                "page_id": page_id,
+                "properties": {"Status": {"select": {"name": "pending"}}},
+            })
+            _raise_if_error(result, f"send_cart page {page_id}")
+        except Exception as e:
+            errors += 1
+            logger.error(f"send_cart patch failed for page {page_id}: {e}")
+            if errors >= 2:
+                raise RuntimeError(f"send_cart aborted after 2 errors. Last: {e}")
+
+    logger.info(f"Cart {cart_id} sent — {len(pages)} items flipped to pending")
+    return cart_id
+
+
+async def clear_cart(cart_id: str) -> int:
+    """Archive all Status='cart' rows for cart_id. Returns count deleted."""
+    tools = await _get_tools()
+    patch = _require(tools, "API-patch-page")
+
+    pages = await get_cart_items(cart_id)
+    count = 0
+    for page in pages:
+        page_id = page.get("id") if isinstance(page, dict) else None
+        if not page_id:
+            continue
+        try:
+            await patch.ainvoke({"page_id": page_id, "archived": True})
+            count += 1
+        except Exception as e:
+            logger.error(f"clear_cart archive failed for page {page_id}: {e}")
+
+    logger.info(f"Cleared {count} cart rows for cart_id={cart_id}")
+    return count
+
+
+async def remove_cart_item(cart_id: str, item_name: str) -> bool:
+    """Archive the first cart row matching item_name. Returns True if found."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+    patch = _require(tools, "API-patch-page")
+
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {
+                "and": [
+                    {"property": "OrderID", "rich_text": {"equals": cart_id}},
+                    {"property": "Status", "select": {"equals": "cart"}},
+                    {"property": "Item", "title": {"equals": item_name}},
+                ]
+            },
+        })
+    except Exception as e:
+        logger.error(f"remove_cart_item query failed: {e}")
+        raise
+
+    pages = result if isinstance(result, list) else result.get("results", [])
+    if pages and isinstance(pages[0], dict) and "text" in pages[0]:
+        try:
+            data = json.loads(pages[0]["text"])
+            pages = data.get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    if not pages:
+        return False
+
+    page_id = pages[0].get("id") if isinstance(pages[0], dict) else None
+    if not page_id:
+        return False
+
+    try:
+        await patch.ainvoke({"page_id": page_id, "archived": True})
+        logger.info(f"Removed cart item {item_name!r} from cart {cart_id}")
+        return True
+    except Exception as e:
+        logger.error(f"remove_cart_item archive failed: {e}")
+        raise
+
+
+# ── legacy push (kept for shopkeeper flow compatibility) ─────────────────────
+
 async def push_order(items: List) -> str:
     from src.config import settings
 

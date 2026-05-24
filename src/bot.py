@@ -1,9 +1,10 @@
 """MomCart Telegram bot — entrypoint."""
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from loguru import logger
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -19,8 +20,45 @@ from telegram.ext import (
 
 from src.config import settings
 
-# per-user session: MOM_ID -> {items, order_id, awaiting_confirm}
-_sessions: dict = {}
+# ── active cart persistence ────────────────────────────────────────────────────
+# data/active_cart.json schema:
+# { "cart_id": "ABCD1234", "last_page_ids": ["page-id-1", ...] }
+
+_CART_FILE = Path("data/active_cart.json")
+
+
+def _load_cart() -> dict:
+    if _CART_FILE.exists():
+        try:
+            return json.loads(_CART_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_cart(data: dict) -> None:
+    _CART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CART_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _clear_cart_file() -> None:
+    if _CART_FILE.exists():
+        _CART_FILE.unlink()
+
+
+def _get_or_create_cart_id() -> str:
+    data = _load_cart()
+    if data.get("cart_id"):
+        return data["cart_id"]
+    from src.notion_tools import _short_id
+    cart_id = _short_id()
+    _save_cart({"cart_id": cart_id, "last_page_ids": []})
+    return cart_id
+
+
+# ── last-sent order tracking (in-memory, for /last and /status) ───────────────
+# { "order_id": str, "items": List[GroceryItem], "done": {idx: status_key} }
+_last_order: dict = {}
 
 # ── label sets ────────────────────────────────────────────────────────────────
 _STATUS_LABEL = {
@@ -28,10 +66,16 @@ _STATUS_LABEL = {
     "partial": "⚠️ Partial",
     "out":     "❌ Out",
 }
-_STATUS_NOTION = {          # callback status → Notion Status select value
+_STATUS_NOTION = {
     "ok":      "packed",
     "partial": "partial",
     "out":     "out",
+}
+
+# natural-language triggers for /send
+_SEND_PHRASES = {
+    "send to shop", "bhej do", "shop ko bhej do", "send karo",
+    "send kar do", "order karo", "order kar do",
 }
 
 
@@ -86,7 +130,34 @@ async def _notify_shopkeeper(app: Application, order_id: str, items: List) -> No
         logger.error(f"Failed to notify shopkeeper: {e}")
 
 
-# ── commands ──────────────────────────────────────────────────────────────────
+# ── cart table formatter ──────────────────────────────────────────────────────
+
+def _cart_table(items: List, header: str = "MomCart Cart",
+                statuses: dict | None = None) -> str:
+    """Return an HTML <pre> block with right-aligned qty column."""
+    _STATUS_EMOJI = {"packed": "✅", "partial": "⚠️", "out": "❌", "pending": "⏳", "cart": "🛒"}
+    sep = "─" * 26
+    name_width = max((len(i.name_en) for i in items), default=10)
+    name_width = max(name_width, 12)
+
+    rows = [header, sep]
+    for item in items:
+        qty = int(item.qty) if item.qty == int(item.qty) else item.qty
+        qty_str = f"{qty} {item.unit}"
+        name_col = item.name_en[:name_width].ljust(name_width)
+        if statuses:
+            s = statuses.get(item.name_en, "pending")
+            emoji = _STATUS_EMOJI.get(s, "⏳")
+            rows.append(f"{emoji} {name_col}  {qty_str}")
+        else:
+            rows.append(f"{name_col}  {qty_str}")
+    rows.append(sep)
+    rows.append(f"Total: {len(items)} item{'s' if len(items) != 1 else ''}")
+    inner = "\n".join(rows)
+    return f"<pre>{inner}</pre>"
+
+
+# ── /start ────────────────────────────────────────────────────────────────────
 
 async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     role = _role(update)
@@ -95,8 +166,15 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if role == "mom":
         await update.message.reply_text(
-            "Namaste Mummy! 🙏 Voice note bhejo ya photo, main list bana dunga. "
-            "Confirm karne ke baad shop ko bhej dunga!"
+            "Namaste Mummy! 🙏 Voice note, photo, ya text bhejo — main cart mein "
+            "add karta jaunga. Jab ready ho, '/send' ya 'bhej do' bolna.\n\n"
+            "/cart - cart dekho\n"
+            "/remove <item> - item hatao\n"
+            "/undo - last add wapas lo\n"
+            "/clear - sab khaali karo\n"
+            "/send - shop ko bhej do\n"
+            "/last - pichli order dekho\n"
+            "/status - shop ki progress dekho"
         )
     else:
         await update.message.reply_text(
@@ -105,13 +183,117 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+# ── /cart ─────────────────────────────────────────────────────────────────────
+
+async def _handle_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    cart_data = _load_cart()
+    cart_id = cart_data.get("cart_id")
+    if not cart_id:
+        await update.message.reply_text(
+            "Cart khaali hai. Voice note ya text bhejo items add karne ke liye."
+        )
+        return
+
+    try:
+        from src.notion_tools import get_cart_items
+        from src.agent import GroceryItem
+        pages = await get_cart_items(cart_id)
+        if not pages:
+            await update.message.reply_text(
+                "Cart khaali hai. Voice note ya text bhejo items add karne ke liye."
+            )
+            return
+        items = _pages_to_items(pages)
+        table = _cart_table(items, header=f"Cart #{cart_id}")
+        await update.message.reply_text(
+            f"{table}\n\nSend 'bhej do' ya '/send' jab ready ho, "
+            "'/clear' se khaali karo, '/remove &lt;item&gt;' se ek item hatao.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"/cart failed: {e}")
+        await update.message.reply_text("Cart fetch karne mein problem. Try again.")
+
+
+# ── /last ─────────────────────────────────────────────────────────────────────
+
+async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    order_id = _last_order.get("order_id")
+    if not order_id:
+        await update.message.reply_text("Koi confirmed order nahi mila abhi tak.")
+        return
+
+    try:
+        from src.notion_tools import get_order_summary, _get_tools, _require
+        from src.config import settings as cfg
+        import json as _json
+
+        tools = await _get_tools()
+        query = _require(tools, "API-query-data-source")
+        result = await query.ainvoke({
+            "data_source_id": cfg.NOTION_DATABASE_ID,
+            "filter": {"property": "OrderID", "rich_text": {"equals": order_id}},
+        })
+
+        pages = result if isinstance(result, list) else result.get("results", [])
+        if pages and isinstance(pages[0], dict) and "text" in pages[0]:
+            try:
+                data = _json.loads(pages[0]["text"])
+                pages = data.get("results", [])
+            except _json.JSONDecodeError:
+                pass
+
+        if not pages:
+            await update.message.reply_text(f"Order #{order_id} ka data Notion mein nahi mila.")
+            return
+
+        from src.agent import GroceryItem
+        items_out: List[GroceryItem] = []
+        statuses: dict = {}
+        for page in pages:
+            props = page.get("properties", {}) if isinstance(page, dict) else {}
+            name = (props.get("Item", {}).get("title") or [{}])[0].get("text", {}).get("content", "?")
+            qty = props.get("Qty", {}).get("number") or 0
+            unit = (props.get("Unit", {}).get("select") or {}).get("name", "pcs")
+            status = (props.get("Status", {}).get("select") or {}).get("name", "pending")
+            try:
+                items_out.append(GroceryItem(name_en=name, qty=float(qty), unit=unit))
+                statuses[name] = status
+            except Exception:
+                pass
+
+        counts = await get_order_summary(order_id)
+        header = (
+            f"Last order #{order_id} — "
+            f"{counts.get('packed', 0)} packed, "
+            f"{counts.get('partial', 0)} partial, "
+            f"{counts.get('out', 0)} out, "
+            f"{counts.get('pending', 0)} pending"
+        )
+        table = _cart_table(items_out, header=header, statuses=statuses)
+        await update.message.reply_text(table, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"/last failed: {e}")
+        await update.message.reply_text("Last order fetch karne mein problem. Try again.")
+
+
+# ── /status ───────────────────────────────────────────────────────────────────
+
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
         await update.message.reply_text("not authorized")
         return
 
-    session = _sessions.get(settings.MOM_ID, {})
-    order_id = session.get("order_id")
+    order_id = _last_order.get("order_id")
     if not order_id:
         await update.message.reply_text("Koi active order nahi hai abhi.")
         return
@@ -129,22 +311,156 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Status fetch karne mein problem. Try again.")
 
 
-# ── confirm vocabulary ────────────────────────────────────────────────────────
+# ── /send ─────────────────────────────────────────────────────────────────────
 
-_AFFIRM = {
-    "yes", "y", "yep", "yeah", "yup",
-    "haan", "haa", "ji", "ok", "okay",
-    "sure", "theek hai", "thik hai",
-    "send", "send it", "confirm",
-    "haan bhej do", "bhej do",
-}
-_CANCEL = {"no", "n", "nahi", "cancel", "ruk"}
+async def _do_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Core logic for /send command and natural-language send triggers."""
+    cart_data = _load_cart()
+    cart_id = cart_data.get("cart_id")
+    if not cart_id:
+        await update.message.reply_text("Cart khaali hai — pehle kuch items add karo.")
+        return
+
+    try:
+        from src.notion_tools import get_cart_items, send_cart
+        pages = await get_cart_items(cart_id)
+        if not pages:
+            await update.message.reply_text("Cart khaali hai — pehle kuch items add karo.")
+            return
+
+        items = _pages_to_items(pages)
+        await update.message.reply_text("Order bhej raha hoon... ⏳")
+
+        order_id = await send_cart(cart_id)
+
+        # clear cart file so next add starts fresh
+        _clear_cart_file()
+
+        # store for /last and /status
+        global _last_order
+        _last_order = {"order_id": order_id, "items": items, "done": {}}
+
+        await update.message.reply_text(f"Order #{order_id} shop ko bhej diya ✅")
+        await _notify_shopkeeper(context.application, order_id, items)
+    except Exception as e:
+        logger.error(f"/send failed: {e}")
+        await update.message.reply_text("Order bhejne mein problem. Try again.")
 
 
-# ── core flow helpers ──────────────────────────────────────────────────────────
+async def _handle_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+    await _do_send(update, context)
 
-async def _parse_and_reply(update: Update, text: str) -> None:
-    await update.message.reply_text("List bana raha hoon... 🛒")
+
+# ── /clear ────────────────────────────────────────────────────────────────────
+
+async def _handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    cart_data = _load_cart()
+    cart_id = cart_data.get("cart_id")
+    if not cart_id:
+        await update.message.reply_text("Cart pehle se khaali hai.")
+        return
+
+    try:
+        from src.notion_tools import clear_cart
+        count = await clear_cart(cart_id)
+        _clear_cart_file()
+        await update.message.reply_text(f"Cart khaali kar diya ({count} items removed).")
+    except Exception as e:
+        logger.error(f"/clear failed: {e}")
+        await update.message.reply_text("Cart clear karne mein problem. Try again.")
+
+
+# ── /remove <item> ────────────────────────────────────────────────────────────
+
+async def _handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    item_arg = " ".join(context.args).strip() if context.args else ""
+    if not item_arg:
+        await update.message.reply_text("Usage: /remove <item name>  (e.g. /remove potato)")
+        return
+
+    cart_data = _load_cart()
+    cart_id = cart_data.get("cart_id")
+    if not cart_id:
+        await update.message.reply_text("Cart khaali hai.")
+        return
+
+    # canonicalize via pantry so "potatoes" -> "potato"
+    try:
+        from src.memory import search_pantry
+        hits = search_pantry(item_arg, n=1)
+        canonical = hits[0].get("name_en", item_arg) if hits and hits[0]["distance"] < 0.35 else item_arg
+    except Exception:
+        canonical = item_arg
+
+    try:
+        from src.notion_tools import remove_cart_item
+        found = await remove_cart_item(cart_id, canonical)
+        if found:
+            await update.message.reply_text(f"'{canonical}' cart se hata diya.")
+        else:
+            await update.message.reply_text(
+                f"'{canonical}' cart mein nahi mila. "
+                "'/cart' se current items dekho."
+            )
+    except Exception as e:
+        logger.error(f"/remove failed: {e}")
+        await update.message.reply_text("Remove karne mein problem. Try again.")
+
+
+# ── /undo ─────────────────────────────────────────────────────────────────────
+
+async def _handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    cart_data = _load_cart()
+    cart_id = cart_data.get("cart_id")
+    last_page_ids: list = cart_data.get("last_page_ids", [])
+
+    if not cart_id or not last_page_ids:
+        await update.message.reply_text("Kuch undo karne ke liye nahi hai.")
+        return
+
+    try:
+        from src.notion_tools import _get_tools, _require
+        tools = await _get_tools()
+        patch = _require(tools, "API-patch-page")
+
+        count = 0
+        for page_id in last_page_ids:
+            try:
+                await patch.ainvoke({"page_id": page_id, "archived": True})
+                count += 1
+            except Exception as e:
+                logger.error(f"Undo archive failed for {page_id}: {e}")
+
+        # clear last_page_ids but keep cart_id (other items remain)
+        cart_data["last_page_ids"] = []
+        _save_cart(cart_data)
+
+        await update.message.reply_text(f"Last add undo kar diya ({count} items removed).")
+    except Exception as e:
+        logger.error(f"/undo failed: {e}")
+        await update.message.reply_text("Undo karne mein problem. Try again.")
+
+
+# ── core add flow ──────────────────────────────────────────────────────────────
+
+async def _add_items(update: Update, text: str) -> None:
+    """Parse text → canonicalize → append to persistent cart."""
+    await update.message.reply_text("Cart mein add kar raha hoon... 🛒")
     try:
         from src.agent import format_item_list, parse_grocery_text
         items = await parse_grocery_text(text, user_id=settings.MOM_ID)
@@ -153,58 +469,25 @@ async def _parse_and_reply(update: Update, text: str) -> None:
                 "Koi items samajh nahi aaya. Dobara bolo? (e.g. 'do kilo aata, ek paav haldi')"
             )
             return
-        _sessions[settings.MOM_ID] = {"items": items, "awaiting_confirm": True}
+
+        cart_id = _get_or_create_cart_id()
+
+        from src.notion_tools import add_to_cart
+        new_page_ids = await add_to_cart(items, cart_id)
+
+        # persist last-added IDs for /undo
+        cart_data = _load_cart()
+        cart_data["last_page_ids"] = new_page_ids
+        _save_cart(cart_data)
+
+        added_list = format_item_list(items)
         await update.message.reply_text(
-            f"Got it:\n{format_item_list(items)}\n\nConfirm? yes/no"
+            f"Cart mein add ho gaya:\n{added_list}\n\n"
+            "'/undo' se wapas lo, ya aur items bhejo."
         )
     except Exception as e:
-        logger.error(f"Parse error: {e}")
+        logger.error(f"Add items error: {e}")
         await update.message.reply_text("Processing mein problem. Try again.")
-
-
-async def _parse_as_correction(update: Update, text: str, old_session: dict) -> None:
-    """Re-parse a correction; keep the old draft alive if the new parse yields nothing."""
-    await update.message.reply_text("Theek hai, naya list bana raha hoon...")
-    try:
-        from src.agent import format_item_list, parse_grocery_text
-        items = await parse_grocery_text(text, user_id=settings.MOM_ID)
-        if not items:
-            # restore old draft — don't lose it on a bad correction
-            _sessions[settings.MOM_ID] = old_session
-            from src.agent import format_item_list as fmt
-            await update.message.reply_text(
-                "Samajh nahi aaya. Original list still pending:\n"
-                f"{fmt(old_session['items'])}\n\n"
-                "Reply 'yes' to confirm or send new items."
-            )
-            return
-        _sessions[settings.MOM_ID] = {"items": items, "awaiting_confirm": True}
-        await update.message.reply_text(
-            f"Got it:\n{format_item_list(items)}\n\nConfirm? yes/no"
-        )
-    except Exception as e:
-        logger.error(f"Correction parse error: {e}")
-        _sessions[settings.MOM_ID] = old_session
-        await update.message.reply_text("Processing mein problem. Original list still pending — reply 'yes' to confirm.")
-
-
-async def _confirm_and_push(update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
-    items = session["items"]
-    await update.message.reply_text("Notion mein save kar raha hoon... ⏳")
-    try:
-        from src.notion_tools import push_order
-        order_id = await push_order(items)
-        _sessions[settings.MOM_ID] = {
-            "order_id": order_id,
-            "items": items,
-            "awaiting_confirm": False,
-            "done": {},          # idx -> status_key for shopkeeper taps
-        }
-        await update.message.reply_text(f"Order #{order_id} sent to shop ✅")
-        await _notify_shopkeeper(context.application, order_id, items)
-    except Exception as e:
-        logger.error(f"push_order failed: {e}")
-        await update.message.reply_text("Notion mein save nahi hua. Check logs aur try again.")
 
 
 # ── message handlers ───────────────────────────────────────────────────────────
@@ -228,7 +511,7 @@ async def _handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.message.reply_text("Couldn't hear anything clearly. Try again?")
             return
         await update.message.reply_text(f"Heard: {transcript}")
-        await _parse_and_reply(update, transcript)
+        await _add_items(update, transcript)
     except Exception as e:
         logger.error(f"Voice handler error: {e}")
         await update.message.reply_text("Something went wrong processing your voice note.")
@@ -253,141 +536,13 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = update.message.text.strip()
     logger.info(f"text from mom: {text!r}")
-    session = _sessions.get(settings.MOM_ID, {})
 
-    if session.get("awaiting_confirm"):
-        tl = text.lower().strip()
-        if tl in _AFFIRM:
-            await _confirm_and_push(update, context, session)
-        elif tl in _CANCEL:
-            _sessions.pop(settings.MOM_ID, None)
-            await update.message.reply_text("Order cancel ho gaya.")
-        else:
-            # correction — discard draft only if new parse succeeds
-            await _parse_as_correction(update, text, old_session=session)
+    # check for natural-language send triggers
+    if text.lower() in _SEND_PHRASES:
+        await _do_send(update, context)
         return
 
-    await _parse_and_reply(update, text)
-
-
-# ── cart table formatter ──────────────────────────────────────────────────────
-
-def _cart_table(items: List, header: str = "MomCart Order",
-                statuses: dict | None = None) -> str:
-    """Return an HTML <pre> block with right-aligned qty column.
-
-    statuses: optional {idx: notion_status_str} for /last command.
-    """
-    _STATUS_EMOJI = {"packed": "✅", "partial": "⚠️", "out": "❌", "pending": "⏳"}
-    sep = "─" * 26
-    name_width = max((len(i.name_en) for i in items), default=10)
-    name_width = max(name_width, 12)
-
-    rows = [header, sep]
-    for idx, item in enumerate(items):
-        qty = int(item.qty) if item.qty == int(item.qty) else item.qty
-        qty_str = f"{qty} {item.unit}"
-        name_col = item.name_en[:name_width].ljust(name_width)
-        if statuses:
-            s = statuses.get(item.name_en, "pending")
-            emoji = _STATUS_EMOJI.get(s, "⏳")
-            rows.append(f"{emoji} {name_col}  {qty_str}")
-        else:
-            rows.append(f"{name_col}  {qty_str}")
-    rows.append(sep)
-    rows.append(f"Total: {len(items)} item{'s' if len(items) != 1 else ''}")
-    inner = "\n".join(rows)
-    return f"<pre>{inner}</pre>"
-
-
-# ── /cart and /last handlers ──────────────────────────────────────────────────
-
-async def _handle_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
-        return
-
-    session = _sessions.get(settings.MOM_ID, {})
-    items = session.get("items") if session.get("awaiting_confirm") else None
-
-    if not items:
-        await update.message.reply_text("Cart khaali hai. Voice note ya text bhejo.")
-        return
-
-    table = _cart_table(items)
-    await update.message.reply_text(
-        f"{table}\nReply 'yes' to send to shop, 'no' to cancel, or send new items to correct.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
-        return
-
-    session = _sessions.get(settings.MOM_ID, {})
-    order_id = session.get("order_id")
-
-    if not order_id:
-        await update.message.reply_text("Koi confirmed order nahi mila abhi tak.")
-        return
-
-    try:
-        from src.notion_tools import get_order_summary, _get_tools, _require
-        from src.config import settings as cfg
-        import json
-
-        tools = await _get_tools()
-        query = _require(tools, "API-query-data-source")
-        result = await query.ainvoke({
-            "data_source_id": cfg.NOTION_DATABASE_ID,
-            "filter": {"property": "OrderID", "rich_text": {"equals": order_id}},
-        })
-
-        pages = result if isinstance(result, list) else result.get("results", [])
-        # MCP returns text blocks — unwrap if needed
-        if pages and isinstance(pages[0], dict) and "text" in pages[0]:
-            try:
-                data = json.loads(pages[0]["text"])
-                pages = data.get("results", [])
-            except json.JSONDecodeError:
-                pass
-
-        if not pages:
-            await update.message.reply_text(f"Order #{order_id} ka data Notion mein nahi mila.")
-            return
-
-        # build item list + status map from Notion rows
-        from src.agent import GroceryItem
-        items_out: List[GroceryItem] = []
-        statuses: dict = {}
-        for page in pages:
-            props = page.get("properties", {}) if isinstance(page, dict) else {}
-            name = (props.get("Item", {}).get("title") or [{}])[0].get("text", {}).get("content", "?")
-            qty = props.get("Qty", {}).get("number") or 0
-            unit = (props.get("Unit", {}).get("select") or {}).get("name", "pcs")
-            status = (props.get("Status", {}).get("select") or {}).get("name", "pending")
-            try:
-                items_out.append(GroceryItem(name_en=name, qty=float(qty), unit=unit))
-                statuses[name] = status
-            except Exception:
-                pass
-
-        counts = await get_order_summary(order_id)
-        header = (
-            f"Last order #{order_id} — "
-            f"{counts.get('packed',0)} packed, "
-            f"{counts.get('partial',0)} partial, "
-            f"{counts.get('out',0)} out, "
-            f"{counts.get('pending',0)} pending"
-        )
-        table = _cart_table(items_out, header=header, statuses=statuses)
-        await update.message.reply_text(table, parse_mode=ParseMode.HTML)
-
-    except Exception as e:
-        logger.error(f"/last failed: {e}")
-        await update.message.reply_text("Last order fetch karne mein problem. Try again.")
+    await _add_items(update, text)
 
 
 # ── callback handler ───────────────────────────────────────────────────────────
@@ -403,7 +558,6 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
         return
 
-    # 1. parse callback_data before acking so we can give meaningful feedback
     try:
         _, order_id, idx_str, status_key = query.data.split(":")
         idx = int(idx_str)
@@ -412,8 +566,7 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
         return
 
-    session = _sessions.get(settings.MOM_ID, {})
-    items = session.get("items", [])
+    items = _last_order.get("items", [])
     if not items or idx >= len(items):
         await query.answer("Order data not found", show_alert=True)
         return
@@ -421,7 +574,7 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     item = items[idx]
     notion_status = _STATUS_NOTION[status_key]
 
-    # 2. idempotency check — query current status before writing
+    # idempotency check
     try:
         from src.notion_tools import get_item_status, update_item_status
         current_status = await get_item_status(order_id, item.name_en)
@@ -435,7 +588,6 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Already marked ✓")
         return
 
-    # 3. update Notion
     try:
         await update_item_status(order_id, item.name_en, notion_status)
     except Exception as e:
@@ -445,29 +597,50 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await query.answer()
 
-    # track locally so keyboard rebuild is consistent
-    done = session.setdefault("done", {})
+    done = _last_order.setdefault("done", {})
     done[idx] = status_key
-    _sessions[settings.MOM_ID] = session
 
-    # 4. rebuild keyboard — resolved row collapses to single label button
     new_markup = _order_keyboard(order_id, items, done=done)
     try:
         await query.edit_message_reply_markup(reply_markup=new_markup)
     except Exception as e:
         import telegram
         if isinstance(e, telegram.error.BadRequest) and "not modified" in str(e).lower():
-            logger.debug(f"Markup already up-to-date (no-op edit): {e}")
+            logger.debug(f"Markup already up-to-date: {e}")
         else:
             logger.warning(f"Could not edit markup: {e}")
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def _pages_to_items(pages: list) -> List:
+    """Convert Notion page dicts to GroceryItem list."""
+    from src.agent import GroceryItem
+    items = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        props = page.get("properties", {})
+        name = (props.get("Item", {}).get("title") or [{}])[0].get("text", {}).get("content", "?")
+        qty = props.get("Qty", {}).get("number") or 1
+        unit = (props.get("Unit", {}).get("select") or {}).get("name", "pcs")
+        try:
+            items.append(GroceryItem(name_en=name, qty=float(qty), unit=unit))
+        except Exception:
+            pass
+    return items
 
 
 # ── app builder ────────────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("start",  "Start over"),
-        BotCommand("cart",   "Show pending cart"),
+        BotCommand("start",  "Start / help"),
+        BotCommand("cart",   "Show current cart"),
+        BotCommand("send",   "Send cart to shop"),
+        BotCommand("clear",  "Empty the cart"),
+        BotCommand("remove", "Remove one item from cart"),
+        BotCommand("undo",   "Undo last add"),
         BotCommand("last",   "Show last sent order"),
         BotCommand("status", "Check shopkeeper's progress"),
     ])
@@ -483,6 +656,10 @@ def build_app() -> Application:
     )
     app.add_handler(CommandHandler("start",  _handle_start))
     app.add_handler(CommandHandler("cart",   _handle_cart))
+    app.add_handler(CommandHandler("send",   _handle_send))
+    app.add_handler(CommandHandler("clear",  _handle_clear))
+    app.add_handler(CommandHandler("remove", _handle_remove))
+    app.add_handler(CommandHandler("undo",   _handle_undo))
     app.add_handler(CommandHandler("last",   _handle_last))
     app.add_handler(CommandHandler("status", _handle_status))
     app.add_handler(CallbackQueryHandler(_handle_callback))
