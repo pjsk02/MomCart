@@ -99,6 +99,20 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("got photo (Photo OCR coming soon)")
 
 
+async def _confirm_and_push(update: Update, session: dict) -> None:
+    items = session["items"]
+    await update.message.reply_text("Notion mein save kar raha hoon... ⏳")
+    try:
+        from src.notion_tools import push_order
+        order_id = await push_order(items)
+        _sessions[settings.MOM_ID] = {"order_id": order_id, "items": items, "awaiting_confirm": False}
+        await update.message.reply_text(f"Order #{order_id} sent to shop ✅")
+        logger.info(f"Order {order_id} pushed to Notion ({len(items)} items)")
+    except Exception as e:
+        logger.error(f"push_order failed: {e}")
+        await update.message.reply_text("Notion mein save nahi hua. Check logs aur try again.")
+
+
 async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     role = _role(update)
     if role == "unknown":
@@ -113,8 +127,7 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if session.get("awaiting_confirm"):
         text_lower = text.lower()
         if any(w in text_lower for w in ["yes", "haan", "ha", "ok", "send", "bhejo"]):
-            _sessions[settings.MOM_ID] = {**session, "awaiting_confirm": False}
-            await update.message.reply_text("Order confirmed ✅ (Notion + shopkeeper notify coming in Prompt 6)")
+            await _confirm_and_push(update, session)
         elif any(w in text_lower for w in ["no", "nahi", "cancel"]):
             _sessions.pop(settings.MOM_ID, None)
             await update.message.reply_text("Order cancel ho gaya.")

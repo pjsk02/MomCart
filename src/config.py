@@ -23,6 +23,20 @@ class Settings(BaseSettings):
     NOTION_API_TOKEN: str = ""
     NOTION_DATABASE_ID: str = ""
 
+    @field_validator("NOTION_DATABASE_ID", mode="before")
+    @classmethod
+    def extract_database_uuid(cls, v: str) -> str:
+        """Accept full Notion URLs or bare UUIDs — always store the bare UUID."""
+        import re
+        if not v:
+            return v
+        # match 32-hex-char UUID with optional dashes, anywhere in the string
+        m = re.search(r"([0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12})", v, re.I)
+        if m:
+            raw = m.group(1).replace("-", "")
+            return f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+        return v
+
     # Ollama / Gemma
     OLLAMA_HOST: str = "http://localhost:11434"
     GEMMA_MODEL: str = "gemma4:e4b"
