@@ -1,6 +1,9 @@
 """MomCart Telegram bot — entrypoint."""
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 from loguru import logger
 from telegram import Update
 from telegram.ext import (
@@ -36,9 +39,25 @@ async def _handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if role == "unknown":
         await update.message.reply_text("not authorized")
         return
-    logger.info(f"voice from {role}")
-    duration = update.message.voice.duration
-    await update.message.reply_text(f"got voice ({duration} seconds)")
+    logger.info(f"voice from {role} ({update.message.voice.duration}s)")
+
+    try:
+        tg_file = await context.bot.get_file(update.message.voice.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        await tg_file.download_to_drive(str(tmp_path))
+
+        from src.stt import transcribe
+        transcript = await transcribe(tmp_path)
+        tmp_path.unlink(missing_ok=True)
+
+        if transcript:
+            await update.message.reply_text(f"Heard: {transcript}")
+        else:
+            await update.message.reply_text("Couldn't hear anything clearly. Try again?")
+    except Exception as e:
+        logger.error(f"Voice handler error: {e}")
+        await update.message.reply_text("Something went wrong processing your voice note.")
 
 
 async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
