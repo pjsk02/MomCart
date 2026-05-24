@@ -128,6 +128,18 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Status fetch karne mein problem. Try again.")
 
 
+# ── confirm vocabulary ────────────────────────────────────────────────────────
+
+_AFFIRM = {
+    "yes", "y", "yep", "yeah", "yup",
+    "haan", "haa", "ji", "ok", "okay",
+    "sure", "theek hai", "thik hai",
+    "send", "send it", "confirm",
+    "haan bhej do", "bhej do",
+}
+_CANCEL = {"no", "n", "nahi", "cancel", "ruk"}
+
+
 # ── core flow helpers ──────────────────────────────────────────────────────────
 
 async def _parse_and_reply(update: Update, text: str) -> None:
@@ -147,6 +159,32 @@ async def _parse_and_reply(update: Update, text: str) -> None:
     except Exception as e:
         logger.error(f"Parse error: {e}")
         await update.message.reply_text("Processing mein problem. Try again.")
+
+
+async def _parse_as_correction(update: Update, text: str, old_session: dict) -> None:
+    """Re-parse a correction; keep the old draft alive if the new parse yields nothing."""
+    await update.message.reply_text("Theek hai, naya list bana raha hoon...")
+    try:
+        from src.agent import format_item_list, parse_grocery_text
+        items = await parse_grocery_text(text, user_id=settings.MOM_ID)
+        if not items:
+            # restore old draft — don't lose it on a bad correction
+            _sessions[settings.MOM_ID] = old_session
+            from src.agent import format_item_list as fmt
+            await update.message.reply_text(
+                "Samajh nahi aaya. Original list still pending:\n"
+                f"{fmt(old_session['items'])}\n\n"
+                "Reply 'yes' to confirm or send new items."
+            )
+            return
+        _sessions[settings.MOM_ID] = {"items": items, "awaiting_confirm": True}
+        await update.message.reply_text(
+            f"Got it:\n{format_item_list(items)}\n\nConfirm? yes/no"
+        )
+    except Exception as e:
+        logger.error(f"Correction parse error: {e}")
+        _sessions[settings.MOM_ID] = old_session
+        await update.message.reply_text("Processing mein problem. Original list still pending — reply 'yes' to confirm.")
 
 
 async def _confirm_and_push(update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
@@ -218,16 +256,14 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if session.get("awaiting_confirm"):
         tl = text.lower().strip()
-        if any(w in tl for w in ["yes", "haan", "ha", "ok", "send", "bhejo"]):
+        if tl in _AFFIRM:
             await _confirm_and_push(update, context, session)
-        elif tl in {"no", "nahi", "cancel", "ruk"}:
-            # bare cancel word — drop the draft
+        elif tl in _CANCEL:
             _sessions.pop(settings.MOM_ID, None)
             await update.message.reply_text("Order cancel ho gaya.")
         else:
-            # anything else (including "no, i said..." corrections) → re-parse
-            await update.message.reply_text("Theek hai, naya list bana raha hoon...")
-            await _parse_and_reply(update, text)
+            # correction — discard draft only if new parse succeeds
+            await _parse_as_correction(update, text, old_session=session)
         return
 
     await _parse_and_reply(update, text)
@@ -237,20 +273,22 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()                    # 1. ack immediately
 
     if query.data == "noop":
+        await query.answer()
         return
 
     if not query.data.startswith("p:"):
+        await query.answer()
         return
 
-    # 2. parse callback_data
+    # 1. parse callback_data before acking so we can give meaningful feedback
     try:
         _, order_id, idx_str, status_key = query.data.split(":")
         idx = int(idx_str)
     except ValueError:
         logger.warning(f"Bad callback_data: {query.data!r}")
+        await query.answer()
         return
 
     session = _sessions.get(settings.MOM_ID, {})
@@ -262,14 +300,29 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     item = items[idx]
     notion_status = _STATUS_NOTION[status_key]
 
+    # 2. idempotency check — query current status before writing
+    try:
+        from src.notion_tools import get_item_status, update_item_status
+        current_status = await get_item_status(order_id, item.name_en)
+    except Exception as e:
+        logger.error(f"Notion status check failed: {e}")
+        await query.answer("Notion check failed — check logs", show_alert=True)
+        return
+
+    if current_status == notion_status:
+        logger.debug(f"no-op: {item.name_en!r} already {notion_status}")
+        await query.answer("Already marked ✓")
+        return
+
     # 3. update Notion
     try:
-        from src.notion_tools import update_item_status
         await update_item_status(order_id, item.name_en, notion_status)
     except Exception as e:
         logger.error(f"Notion status update failed: {e}")
         await query.answer("Notion update failed — check logs", show_alert=True)
         return
+
+    await query.answer()
 
     # track locally so keyboard rebuild is consistent
     done = session.setdefault("done", {})
@@ -281,7 +334,11 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         await query.edit_message_reply_markup(reply_markup=new_markup)
     except Exception as e:
-        logger.warning(f"Could not edit markup: {e}")
+        import telegram
+        if isinstance(e, telegram.error.BadRequest) and "not modified" in str(e).lower():
+            logger.debug(f"Markup already up-to-date (no-op edit): {e}")
+        else:
+            logger.warning(f"Could not edit markup: {e}")
 
 
 # ── app builder ────────────────────────────────────────────────────────────────
