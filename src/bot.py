@@ -244,12 +244,12 @@ async def _add_all_from_wishlist(update: Update) -> None:
 
         pages = await get_wishlist_items()
         if not pages:
-            await update.message.reply_text("Wishlist khaali hai.")
+            await update.effective_message.reply_text("Wishlist khaali hai.")
             return
 
         items = _pages_to_items(pages)
         if not items:
-            await update.message.reply_text("Wishlist khaali hai.")
+            await update.effective_message.reply_text("Wishlist khaali hai.")
             return
 
         cart_id, _ = _get_or_create_cart_id()
@@ -264,13 +264,13 @@ async def _add_all_from_wishlist(update: Update) -> None:
         await clear_wishlist()
 
         n = len(items)
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"{n} item{'s' if n != 1 else ''} wishlist se cart mein add ho gaye / "
             f"{n} item{'s' if n != 1 else ''} added from wishlist to cart."
         )
     except Exception as e:
         logger.error(f"add_all_from_wishlist failed: {e}")
-        await update.message.reply_text("Wishlist se add karne mein problem. Try again.")
+        await update.effective_message.reply_text("Wishlist se add karne mein problem. Try again.")
 
 
 async def _maybe_nudge_wishlist(update: Update) -> None:
@@ -296,7 +296,7 @@ async def _maybe_nudge_wishlist(update: Update) -> None:
         cart_data["wishlist_prompted"] = True
         _save_cart(cart_data)
 
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"Wishlist mein {n} item{'s' if n != 1 else ''} hain pichli baar ke "
             f"({preview}). Add karu?\n"
             "Reply 'haan' / 'yes' / 'wishlist add karo' to add all, "
@@ -311,10 +311,10 @@ async def _maybe_nudge_wishlist(update: Update) -> None:
 async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     role = _role(update)
     if role == "unknown":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     if role == "mom":
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Namaste Mummy! 🙏 Voice note, photo, ya text bhejo — main cart mein "
             "add karta jaunga. Jab ready ho, '/send' ya 'bhej do' bolna.\n\n"
             "/cart - cart dekho\n"
@@ -327,7 +327,7 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "/wishlist - dekho missed items / view missed items"
         )
     else:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Order aane par yahan dikhega. "
             "Har item ke samne buttons hain — tap karo status update karne ke liye."
         )
@@ -337,13 +337,20 @@ async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _handle_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     cart_data = _load_cart()
     cart_id = cart_data.get("cart_id")
+    uid = update.effective_user.id if update.effective_user else None
+
+    # ── DIAG 1 ────────────────────────────────────────────────────────────────
+    logger.info(f"[DIAG /cart] active_cart.json raw: {json.dumps(cart_data)}")
+    logger.info(f"[DIAG /cart] resolved cart_id={cart_id!r}  user_id={uid}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     if not cart_id:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Cart khaali hai. Voice note ya text bhejo items add karne ke liye."
         )
         return
@@ -351,33 +358,40 @@ async def _handle_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         from src.notion_tools import get_cart_items
         pages = await get_cart_items(cart_id)
+
+        # ── DIAG 5 (bot side) ─────────────────────────────────────────────────
+        logger.info(f"[DIAG /cart] get_cart_items returned {len(pages)} page(s)")
+        items_from_pages = _pages_to_items(pages)
+        logger.info(f"[DIAG /cart] _pages_to_items produced {len(items_from_pages)} GroceryItem(s)")
+        # ──────────────────────────────────────────────────────────────────────
+
         if not pages:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "Cart khaali hai. Voice note ya text bhejo items add karne ke liye."
             )
             return
-        items = _pages_to_items(pages)
+        items = items_from_pages
         table = _cart_table(items, header=f"Cart #{cart_id}")
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"{table}\n\nSend 'bhej do' ya '/send' jab ready ho, "
             "'/clear' se khaali karo, '/remove &lt;item&gt;' se ek item hatao.",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
         logger.error(f"/cart failed: {e}")
-        await update.message.reply_text("Cart fetch karne mein problem. Try again.")
+        await update.effective_message.reply_text("Cart fetch karne mein problem. Try again.")
 
 
 # ── /last ─────────────────────────────────────────────────────────────────────
 
 async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     order_id = _last_order.get("order_id")
     if not order_id:
-        await update.message.reply_text("Koi confirmed order nahi mila abhi tak.")
+        await update.effective_message.reply_text("Koi confirmed order nahi mila abhi tak.")
         return
 
     try:
@@ -408,7 +422,7 @@ async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
 
         if not pages:
-            await update.message.reply_text(f"Order #{order_id} ka data Notion mein nahi mila.")
+            await update.effective_message.reply_text(f"Order #{order_id} ka data Notion mein nahi mila.")
             return
 
         from src.agent import GroceryItem
@@ -435,23 +449,23 @@ async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"{counts.get('pending', 0)} pending"
         )
         table = _cart_table(items_out, header=header, statuses=statuses)
-        await update.message.reply_text(table, parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(table, parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.error(f"/last failed: {e}")
-        await update.message.reply_text("Last order fetch karne mein problem. Try again.")
+        await update.effective_message.reply_text("Last order fetch karne mein problem. Try again.")
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
 
 async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     order_id = _last_order.get("order_id")
     if not order_id:
-        await update.message.reply_text("Koi active order nahi hai abhi.")
+        await update.effective_message.reply_text("Koi active order nahi hai abhi.")
         return
 
     try:
@@ -461,10 +475,10 @@ async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines = [f"Order #{order_id} status:"]
         for s in ("packed", "partial", "out", "pending"):
             lines.append(f"  {emoji[s]} {s}: {counts.get(s, 0)}")
-        await update.message.reply_text("\n".join(lines))
+        await update.effective_message.reply_text("\n".join(lines))
     except Exception as e:
         logger.error(f"/status failed: {e}")
-        await update.message.reply_text("Status fetch karne mein problem. Try again.")
+        await update.effective_message.reply_text("Status fetch karne mein problem. Try again.")
 
 
 # ── /send ─────────────────────────────────────────────────────────────────────
@@ -473,18 +487,18 @@ async def _do_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cart_data = _load_cart()
     cart_id = cart_data.get("cart_id")
     if not cart_id:
-        await update.message.reply_text("Cart khaali hai — pehle kuch items add karo.")
+        await update.effective_message.reply_text("Cart khaali hai — pehle kuch items add karo.")
         return
 
     try:
         from src.notion_tools import get_cart_items, send_cart
         pages = await get_cart_items(cart_id)
         if not pages:
-            await update.message.reply_text("Cart khaali hai — pehle kuch items add karo.")
+            await update.effective_message.reply_text("Cart khaali hai — pehle kuch items add karo.")
             return
 
         items = _pages_to_items(pages)
-        await update.message.reply_text("Order bhej raha hoon... ⏳")
+        await update.effective_message.reply_text("Order bhej raha hoon... ⏳")
 
         order_id = await send_cart(cart_id)
         _clear_cart_file()
@@ -492,16 +506,16 @@ async def _do_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         global _last_order
         _last_order = {"order_id": order_id, "items": items, "done": {}}
 
-        await update.message.reply_text(f"Order #{order_id} shop ko bhej diya ✅")
+        await update.effective_message.reply_text(f"Order #{order_id} shop ko bhej diya ✅")
         await _notify_shopkeeper(context.application, order_id, items)
     except Exception as e:
         logger.error(f"/send failed: {e}")
-        await update.message.reply_text("Order bhejne mein problem. Try again.")
+        await update.effective_message.reply_text("Order bhejne mein problem. Try again.")
 
 
 async def _handle_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     await _do_send(update, context)
 
@@ -510,41 +524,41 @@ async def _handle_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     cart_data = _load_cart()
     cart_id = cart_data.get("cart_id")
     if not cart_id:
-        await update.message.reply_text("Cart pehle se khaali hai.")
+        await update.effective_message.reply_text("Cart pehle se khaali hai.")
         return
 
     try:
         from src.notion_tools import clear_cart
         count = await clear_cart(cart_id)
         _clear_cart_file()
-        await update.message.reply_text(f"Cart khaali kar diya ({count} items removed).")
+        await update.effective_message.reply_text(f"Cart khaali kar diya ({count} items removed).")
     except Exception as e:
         logger.error(f"/clear failed: {e}")
-        await update.message.reply_text("Cart clear karne mein problem. Try again.")
+        await update.effective_message.reply_text("Cart clear karne mein problem. Try again.")
 
 
 # ── /remove <item> ────────────────────────────────────────────────────────────
 
 async def _handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     item_arg = " ".join(context.args).strip() if context.args else ""
     if not item_arg:
-        await update.message.reply_text("Usage: /remove <item name>  (e.g. /remove potato)")
+        await update.effective_message.reply_text("Usage: /remove <item name>  (e.g. /remove potato)")
         return
 
     cart_data = _load_cart()
     cart_id = cart_data.get("cart_id")
     if not cart_id:
-        await update.message.reply_text("Cart khaali hai.")
+        await update.effective_message.reply_text("Cart khaali hai.")
         return
 
     try:
@@ -558,21 +572,21 @@ async def _handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         from src.notion_tools import remove_cart_item
         found = await remove_cart_item(cart_id, canonical)
         if found:
-            await update.message.reply_text(f"'{canonical}' cart se hata diya.")
+            await update.effective_message.reply_text(f"'{canonical}' cart se hata diya.")
         else:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"'{canonical}' cart mein nahi mila. '/cart' se current items dekho."
             )
     except Exception as e:
         logger.error(f"/remove failed: {e}")
-        await update.message.reply_text("Remove karne mein problem. Try again.")
+        await update.effective_message.reply_text("Remove karne mein problem. Try again.")
 
 
 # ── /undo ─────────────────────────────────────────────────────────────────────
 
 async def _handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     cart_data = _load_cart()
@@ -580,7 +594,7 @@ async def _handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     last_page_ids: list = cart_data.get("last_page_ids", [])
 
     if not cart_id or not last_page_ids:
-        await update.message.reply_text("Kuch undo karne ke liye nahi hai.")
+        await update.effective_message.reply_text("Kuch undo karne ke liye nahi hai.")
         return
 
     try:
@@ -599,17 +613,17 @@ async def _handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         cart_data["last_page_ids"] = []
         _save_cart(cart_data)
 
-        await update.message.reply_text(f"Last add undo kar diya ({count} items removed).")
+        await update.effective_message.reply_text(f"Last add undo kar diya ({count} items removed).")
     except Exception as e:
         logger.error(f"/undo failed: {e}")
-        await update.message.reply_text("Undo karne mein problem. Try again.")
+        await update.effective_message.reply_text("Undo karne mein problem. Try again.")
 
 
 # ── /wishlist ─────────────────────────────────────────────────────────────────
 
 async def _handle_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
 
     # sub-commands: /wishlist clear, /wishlist remove <item>
@@ -620,7 +634,7 @@ async def _handle_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if args and args[0].lower() == "remove":
         item_arg = " ".join(args[1:]).strip()
         if not item_arg:
-            await update.message.reply_text("Usage: /wishlist remove <item>")
+            await update.effective_message.reply_text("Usage: /wishlist remove <item>")
             return
         await _do_wishlist_remove(update, item_arg)
         return
@@ -629,13 +643,13 @@ async def _handle_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         from src.notion_tools import get_wishlist_items
         pages = await get_wishlist_items()
         if not pages:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "Wishlist khaali hai. / Wishlist is empty."
             )
             return
         items = _pages_to_items(pages)
         table = _cart_table(items, header="💭 Wishlist")
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"{table}\n\n"
             "Reply 'add all from wishlist' to put everything back in cart, "
             "ya '/wishlist remove &lt;item&gt;' / '/wishlist clear' se manage karo.",
@@ -643,20 +657,20 @@ async def _handle_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except Exception as e:
         logger.error(f"/wishlist failed: {e}")
-        await update.message.reply_text("Wishlist fetch karne mein problem. Try again.")
+        await update.effective_message.reply_text("Wishlist fetch karne mein problem. Try again.")
 
 
 async def _handle_wishlist_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     try:
         from src.notion_tools import clear_wishlist
         count = await clear_wishlist()
-        await update.message.reply_text(f"Wishlist khaali kar diya ({count} items removed).")
+        await update.effective_message.reply_text(f"Wishlist khaali kar diya ({count} items removed).")
     except Exception as e:
         logger.error(f"/wishlist_clear failed: {e}")
-        await update.message.reply_text("Wishlist clear karne mein problem. Try again.")
+        await update.effective_message.reply_text("Wishlist clear karne mein problem. Try again.")
 
 
 async def _do_wishlist_remove(update: Update, item_arg: str) -> None:
@@ -671,23 +685,23 @@ async def _do_wishlist_remove(update: Update, item_arg: str) -> None:
         from src.notion_tools import remove_wishlist_item
         found = await remove_wishlist_item(canonical)
         if found:
-            await update.message.reply_text(f"'{canonical}' wishlist se hata diya.")
+            await update.effective_message.reply_text(f"'{canonical}' wishlist se hata diya.")
         else:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"'{canonical}' wishlist mein nahi mila. '/wishlist' se dekho."
             )
     except Exception as e:
         logger.error(f"wishlist_remove failed: {e}")
-        await update.message.reply_text("Remove karne mein problem. Try again.")
+        await update.effective_message.reply_text("Remove karne mein problem. Try again.")
 
 
 async def _handle_wishlist_remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     item_arg = " ".join(context.args).strip() if context.args else ""
     if not item_arg:
-        await update.message.reply_text("Usage: /wishlist_remove <item>")
+        await update.effective_message.reply_text("Usage: /wishlist_remove <item>")
         return
     await _do_wishlist_remove(update, item_arg)
 
@@ -696,12 +710,12 @@ async def _handle_wishlist_remove_cmd(update: Update, context: ContextTypes.DEFA
 
 async def _add_items(update: Update, text: str) -> None:
     """Parse text → canonicalize → append to persistent cart."""
-    await update.message.reply_text("Cart mein add kar raha hoon... 🛒")
+    await update.effective_message.reply_text("Cart mein add kar raha hoon... 🛒")
     try:
         from src.agent import format_item_list, parse_grocery_text
         items = await parse_grocery_text(text, user_id=settings.MOM_ID)
         if not items:
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 "Koi items samajh nahi aaya. Dobara bolo? (e.g. 'do kilo aata, ek paav haldi')"
             )
             return
@@ -716,7 +730,7 @@ async def _add_items(update: Update, text: str) -> None:
         _save_cart(cart_data)
 
         added_list = format_item_list(items)
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"Cart mein add ho gaya:\n{added_list}\n\n"
             "'/undo' se wapas lo, ya aur items bhejo."
         )
@@ -727,14 +741,14 @@ async def _add_items(update: Update, text: str) -> None:
 
     except Exception as e:
         logger.error(f"Add items error: {e}")
-        await update.message.reply_text("Processing mein problem. Try again.")
+        await update.effective_message.reply_text("Processing mein problem. Try again.")
 
 
 # ── message handlers ───────────────────────────────────────────────────────────
 
 async def _handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     logger.info(f"voice from mom ({update.message.voice.duration}s)")
     try:
@@ -748,31 +762,31 @@ async def _handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         tmp_path.unlink(missing_ok=True)
 
         if not transcript:
-            await update.message.reply_text("Couldn't hear anything clearly. Try again?")
+            await update.effective_message.reply_text("Couldn't hear anything clearly. Try again?")
             return
-        await update.message.reply_text(f"Heard: {transcript}")
+        await update.effective_message.reply_text(f"Heard: {transcript}")
         await _add_items(update, transcript)
     except Exception as e:
         logger.error(f"Voice handler error: {e}")
-        await update.message.reply_text("Something went wrong processing your voice note.")
+        await update.effective_message.reply_text("Something went wrong processing your voice note.")
 
 
 async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _role(update) != "mom":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     logger.info("photo from mom")
-    await update.message.reply_text("got photo (Photo OCR coming in bonus prompt)")
+    await update.effective_message.reply_text("got photo (Photo OCR coming in bonus prompt)")
 
 
 async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global _wishlist_nudge_pending
     role = _role(update)
     if role == "unknown":
-        await update.message.reply_text("not authorized")
+        await update.effective_message.reply_text("not authorized")
         return
     if role == "shopkeeper":
-        await update.message.reply_text("Orders yahan inline buttons ke through aayenge.")
+        await update.effective_message.reply_text("Orders yahan inline buttons ke through aayenge.")
         return
 
     text = update.message.text.strip()

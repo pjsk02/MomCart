@@ -135,28 +135,40 @@ async def get_cart_items(cart_id: str) -> list[dict]:
     tools = await _get_tools()
     query = _require(tools, "API-query-data-source")
 
+    # ── DIAG 2: tool name ────────────────────────────────────────────────────
+    logger.info(f"[DIAG get_cart_items] MCP tool name: {query.name!r}")
+
+    query_args = {
+        "data_source_id": settings.NOTION_DATABASE_ID,
+        "filter": {
+            "and": [
+                {"property": "OrderID", "rich_text": {"equals": cart_id}},
+                {"property": "Status", "select": {"equals": "cart"}},
+            ]
+        },
+    }
+    # ── DIAG 3: full arguments ───────────────────────────────────────────────
+    logger.info(f"[DIAG get_cart_items] query args:\n{json.dumps(query_args, indent=2)}")
+
     try:
-        result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
-            "filter": {
-                "and": [
-                    {"property": "OrderID", "rich_text": {"equals": cart_id}},
-                    {"property": "Status", "select": {"equals": "cart"}},
-                ]
-            },
-        })
+        result = await query.ainvoke(query_args)
     except Exception as e:
         logger.error(f"get_cart_items failed (cart_id={cart_id}): {e}")
         raise
 
-    pages = result if isinstance(result, list) else result.get("results", [])
-    # unwrap MCP text blocks if needed
-    if pages and isinstance(pages[0], dict) and "text" in pages[0]:
-        try:
-            data = json.loads(pages[0]["text"])
-            pages = data.get("results", [])
-        except json.JSONDecodeError:
-            pass
+    # ── DIAG 4: full raw response ─────────────────────────────────────────────
+    logger.info(f"[DIAG get_cart_items] raw MCP response:\n{json.dumps(result, indent=2, default=str)}")
+
+    pre_unwrap = result if isinstance(result, list) else result.get("results", [])
+    pre_unwrap_count = len(pre_unwrap)
+
+    pages = _unwrap_pages(result)
+
+    # ── DIAG 5: row counts ────────────────────────────────────────────────────
+    logger.info(
+        f"[DIAG get_cart_items] pre-unwrap count={pre_unwrap_count}, "
+        f"post-unwrap count={len(pages)}"
+    )
 
     return pages
 
@@ -235,13 +247,7 @@ async def remove_cart_item(cart_id: str, item_name: str) -> bool:
         logger.error(f"remove_cart_item query failed: {e}")
         raise
 
-    pages = result if isinstance(result, list) else result.get("results", [])
-    if pages and isinstance(pages[0], dict) and "text" in pages[0]:
-        try:
-            data = json.loads(pages[0]["text"])
-            pages = data.get("results", [])
-        except json.JSONDecodeError:
-            pass
+    pages = _unwrap_pages(result)
 
     if not pages:
         return False
@@ -262,12 +268,29 @@ async def remove_cart_item(cart_id: str, item_name: str) -> bool:
 # ── wishlist operations ────────────────────────────────────────────────────────
 
 def _unwrap_pages(result) -> list:
-    """Normalise MCP result to a list of page dicts."""
+    """Normalise MCP result to a list of page dicts.
+
+    MCP tools return results as [{"type":"text","text":"<json>"}].
+    The JSON may be {"results":[...]}, a bare list, or a single page object.
+    """
     pages = result if isinstance(result, list) else result.get("results", [])
     if pages and isinstance(pages[0], dict) and "text" in pages[0]:
         try:
             data = json.loads(pages[0]["text"])
-            pages = data.get("results", [])
+            if isinstance(data, dict):
+                if "results" in data:
+                    pages = data["results"]
+                elif data.get("object") == "page":
+                    pages = [data]
+                else:
+                    for v in data.values():
+                        if isinstance(v, list) and v:
+                            pages = v
+                            break
+                    else:
+                        pages = []
+            elif isinstance(data, list):
+                pages = data
         except json.JSONDecodeError:
             pass
     return pages
