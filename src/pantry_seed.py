@@ -5,7 +5,7 @@ import pandas as pd
 from loguru import logger
 
 CATEGORIES = [
-    "Foodgrains, Oils & Masala",
+    "Foodgrains, Oil & Masala",   # exact CSV value (not "Oils")
     "Snacks & Branded Foods",
     "Gourmet & World Food",
     "Bakery, Cakes & Dairy",
@@ -45,10 +45,12 @@ def seed_from_csv(csv_path: Path, limit: int = 200) -> int:
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     logger.debug(f"Columns: {list(df.columns)}")
 
-    # filter categories
-    cat_col = next((c for c in df.columns if "categor" in c), None)
-    type_col = next((c for c in df.columns if c in ("type", "sub_category", "sub-category")), None)
-    name_col = next((c for c in df.columns if "product" in c or c == "name"), None)
+    # filter categories — exact matches take priority over partial
+    cat_col = next((c for c in df.columns if c == "category"), None) or \
+              next((c for c in df.columns if "categor" in c), None)
+    type_col = next((c for c in df.columns if c == "type"), None)
+    name_col = next((c for c in df.columns if c == "product"), None) or \
+               next((c for c in df.columns if "product" in c or c == "name"), None)
 
     if cat_col:
         mask = df[cat_col].str.contains("|".join(CATEGORIES), case=False, na=False)

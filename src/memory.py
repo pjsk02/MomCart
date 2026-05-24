@@ -12,9 +12,9 @@ from src.config import settings
 if TYPE_CHECKING:
     from src.agent import GroceryItem
 
-_client: chromadb.ClientAPI | None = None
-_pantry: chromadb.Collection | None = None
-_past_orders: chromadb.Collection | None = None
+_client: "chromadb.ClientAPI | None" = None
+_pantry: "chromadb.Collection | None" = None
+_past_orders: "chromadb.Collection | None" = None
 
 
 def _get_client() -> chromadb.ClientAPI:
@@ -96,3 +96,19 @@ async def recall_last_order(user_id: int) -> list | None:
     except Exception as e:
         logger.error(f"recall_last_order failed: {e}")
         return None
+
+
+# Module-level aliases so callers can do `from src.memory import pantry`
+# The collection is initialised on first access.
+class _LazyCollection:
+    """Proxy that initialises the Chroma collection on first attribute access."""
+
+    def __init__(self, getter):
+        self._getter = getter
+
+    def __getattr__(self, name):
+        return getattr(self._getter(), name)
+
+
+pantry = _LazyCollection(get_pantry)
+past_orders = _LazyCollection(get_past_orders)
