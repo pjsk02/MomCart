@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import List
 
 from loguru import logger
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -269,6 +270,126 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _parse_and_reply(update, text)
 
 
+# ── cart table formatter ──────────────────────────────────────────────────────
+
+def _cart_table(items: List, header: str = "MomCart Order",
+                statuses: dict | None = None) -> str:
+    """Return an HTML <pre> block with right-aligned qty column.
+
+    statuses: optional {idx: notion_status_str} for /last command.
+    """
+    _STATUS_EMOJI = {"packed": "✅", "partial": "⚠️", "out": "❌", "pending": "⏳"}
+    sep = "─" * 26
+    name_width = max((len(i.name_en) for i in items), default=10)
+    name_width = max(name_width, 12)
+
+    rows = [header, sep]
+    for idx, item in enumerate(items):
+        qty = int(item.qty) if item.qty == int(item.qty) else item.qty
+        qty_str = f"{qty} {item.unit}"
+        name_col = item.name_en[:name_width].ljust(name_width)
+        if statuses:
+            s = statuses.get(item.name_en, "pending")
+            emoji = _STATUS_EMOJI.get(s, "⏳")
+            rows.append(f"{emoji} {name_col}  {qty_str}")
+        else:
+            rows.append(f"{name_col}  {qty_str}")
+    rows.append(sep)
+    rows.append(f"Total: {len(items)} item{'s' if len(items) != 1 else ''}")
+    inner = "\n".join(rows)
+    return f"<pre>{inner}</pre>"
+
+
+# ── /cart and /last handlers ──────────────────────────────────────────────────
+
+async def _handle_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    session = _sessions.get(settings.MOM_ID, {})
+    items = session.get("items") if session.get("awaiting_confirm") else None
+
+    if not items:
+        await update.message.reply_text("Cart khaali hai. Voice note ya text bhejo.")
+        return
+
+    table = _cart_table(items)
+    await update.message.reply_text(
+        f"{table}\nReply 'yes' to send to shop, 'no' to cancel, or send new items to correct.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if _role(update) != "mom":
+        await update.message.reply_text("not authorized")
+        return
+
+    session = _sessions.get(settings.MOM_ID, {})
+    order_id = session.get("order_id")
+
+    if not order_id:
+        await update.message.reply_text("Koi confirmed order nahi mila abhi tak.")
+        return
+
+    try:
+        from src.notion_tools import get_order_summary, _get_tools, _require
+        from src.config import settings as cfg
+        import json
+
+        tools = await _get_tools()
+        query = _require(tools, "API-query-data-source")
+        result = await query.ainvoke({
+            "data_source_id": cfg.NOTION_DATABASE_ID,
+            "filter": {"property": "OrderID", "rich_text": {"equals": order_id}},
+        })
+
+        pages = result if isinstance(result, list) else result.get("results", [])
+        # MCP returns text blocks — unwrap if needed
+        if pages and isinstance(pages[0], dict) and "text" in pages[0]:
+            try:
+                data = json.loads(pages[0]["text"])
+                pages = data.get("results", [])
+            except json.JSONDecodeError:
+                pass
+
+        if not pages:
+            await update.message.reply_text(f"Order #{order_id} ka data Notion mein nahi mila.")
+            return
+
+        # build item list + status map from Notion rows
+        from src.agent import GroceryItem
+        items_out: List[GroceryItem] = []
+        statuses: dict = {}
+        for page in pages:
+            props = page.get("properties", {}) if isinstance(page, dict) else {}
+            name = (props.get("Item", {}).get("title") or [{}])[0].get("text", {}).get("content", "?")
+            qty = props.get("Qty", {}).get("number") or 0
+            unit = (props.get("Unit", {}).get("select") or {}).get("name", "pcs")
+            status = (props.get("Status", {}).get("select") or {}).get("name", "pending")
+            try:
+                items_out.append(GroceryItem(name_en=name, qty=float(qty), unit=unit))
+                statuses[name] = status
+            except Exception:
+                pass
+
+        counts = await get_order_summary(order_id)
+        header = (
+            f"Last order #{order_id} — "
+            f"{counts.get('packed',0)} packed, "
+            f"{counts.get('partial',0)} partial, "
+            f"{counts.get('out',0)} out, "
+            f"{counts.get('pending',0)} pending"
+        )
+        table = _cart_table(items_out, header=header, statuses=statuses)
+        await update.message.reply_text(table, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.error(f"/last failed: {e}")
+        await update.message.reply_text("Last order fetch karne mein problem. Try again.")
+
+
 # ── callback handler ───────────────────────────────────────────────────────────
 
 async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -343,9 +464,26 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ── app builder ────────────────────────────────────────────────────────────────
 
+async def _post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start",  "Start over"),
+        BotCommand("cart",   "Show pending cart"),
+        BotCommand("last",   "Show last sent order"),
+        BotCommand("status", "Check shopkeeper's progress"),
+    ])
+    logger.info("Bot commands registered with Telegram")
+
+
 def build_app() -> Application:
-    app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(settings.TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start",  _handle_start))
+    app.add_handler(CommandHandler("cart",   _handle_cart))
+    app.add_handler(CommandHandler("last",   _handle_last))
     app.add_handler(CommandHandler("status", _handle_status))
     app.add_handler(CallbackQueryHandler(_handle_callback))
     app.add_handler(MessageHandler(filters.VOICE,              _handle_voice))
