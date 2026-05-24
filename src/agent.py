@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import json
-from typing import Literal
+from typing import Literal, Optional
 
 from langchain_ollama import ChatOllama
 from loguru import logger

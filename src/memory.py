@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import json
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
 import chromadb
 from loguru import logger

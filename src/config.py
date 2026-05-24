@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Union
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -35,7 +37,7 @@ class Settings(BaseSettings):
 
     @field_validator("CHROMA_PATH", mode="before")
     @classmethod
-    def resolve_chroma_path(cls, v: str | Path) -> Path:
+    def resolve_chroma_path(cls, v: Union[str, Path]) -> Path:
         return Path(v)
 
 
