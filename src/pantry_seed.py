@@ -4,6 +4,55 @@ from pathlib import Path
 import pandas as pd
 from loguru import logger
 
+# Common Indian fresh produce not present in BigBasket's packaged-goods categories.
+# Seeded in addition to the CSV rows so canonicalization works for everyday items.
+FRESH_PRODUCE = [
+    # vegetables — sold by weight
+    ("potato",         "Fruits & Vegetables", "kg"),
+    ("onion",          "Fruits & Vegetables", "kg"),
+    ("tomato",         "Fruits & Vegetables", "kg"),
+    ("ginger",         "Fruits & Vegetables", "kg"),
+    ("garlic",         "Fruits & Vegetables", "kg"),
+    ("green chilli",   "Fruits & Vegetables", "kg"),
+    ("lady finger",    "Fruits & Vegetables", "kg"),
+    ("brinjal",        "Fruits & Vegetables", "kg"),
+    ("cauliflower",    "Fruits & Vegetables", "kg"),
+    ("cabbage",        "Fruits & Vegetables", "kg"),
+    ("carrot",         "Fruits & Vegetables", "kg"),
+    ("capsicum",       "Fruits & Vegetables", "kg"),
+    ("beetroot",       "Fruits & Vegetables", "kg"),
+    ("french beans",   "Fruits & Vegetables", "kg"),
+    ("green peas",     "Fruits & Vegetables", "kg"),
+    ("spinach",        "Fruits & Vegetables", "kg"),
+    ("fenugreek leaves", "Fruits & Vegetables", "kg"),
+    ("coriander leaves", "Fruits & Vegetables", "kg"),
+    ("mint leaves",    "Fruits & Vegetables", "kg"),
+    ("curry leaves",   "Fruits & Vegetables", "kg"),
+    ("drumstick",      "Fruits & Vegetables", "kg"),
+    ("raw banana",     "Fruits & Vegetables", "kg"),
+    ("raw papaya",     "Fruits & Vegetables", "kg"),
+    ("ridge gourd",    "Fruits & Vegetables", "kg"),
+    ("bottle gourd",   "Fruits & Vegetables", "kg"),
+    ("bitter gourd",   "Fruits & Vegetables", "kg"),
+    ("ash gourd",      "Fruits & Vegetables", "kg"),
+    ("snake gourd",    "Fruits & Vegetables", "kg"),
+    ("cluster beans",  "Fruits & Vegetables", "kg"),
+    ("sweet potato",   "Fruits & Vegetables", "kg"),
+    # fruits — sold by weight
+    ("banana",         "Fruits & Vegetables", "kg"),
+    ("apple",          "Fruits & Vegetables", "kg"),
+    ("mango",          "Fruits & Vegetables", "kg"),
+    ("orange",         "Fruits & Vegetables", "kg"),
+    ("pomegranate",    "Fruits & Vegetables", "kg"),
+    ("papaya",         "Fruits & Vegetables", "kg"),
+    ("watermelon",     "Fruits & Vegetables", "kg"),
+    ("grapes",         "Fruits & Vegetables", "kg"),
+    ("guava",          "Fruits & Vegetables", "kg"),
+    # counted items
+    ("lemon",          "Fruits & Vegetables", "pcs"),
+    ("coconut",        "Fruits & Vegetables", "pcs"),
+]
+
 CATEGORIES = [
     "Foodgrains, Oil & Masala",   # exact CSV value (not "Oils")
     "Snacks & Branded Foods",
@@ -78,6 +127,16 @@ def seed_from_csv(csv_path: Path, limit: int = 200) -> int:
         metadatas.append({"name_en": name, "category": category, "unit": unit})
 
     pantry.upsert(ids=ids, documents=documents, metadatas=metadatas)
+
+    # Append fresh produce (not in BigBasket packaged-goods categories)
+    fp_ids, fp_docs, fp_meta = [], [], []
+    for name, category, unit in FRESH_PRODUCE:
+        fp_ids.append(f"fp_{abs(hash(name)) % 1_000_000}")
+        fp_docs.append(name.lower())
+        fp_meta.append({"name_en": name, "category": category, "unit": unit})
+    pantry.upsert(ids=fp_ids, documents=fp_docs, metadatas=fp_meta)
+    logger.info(f"Added {len(FRESH_PRODUCE)} fresh produce items")
+
     count = pantry.count()
     logger.info(f"pantry_items now has {count} entries")
     return count

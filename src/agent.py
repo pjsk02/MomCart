@@ -12,6 +12,8 @@ from pydantic import BaseModel, ValidationError
 from src.config import settings
 from src.prompts import GROCERY_PARSER_SYSTEM, RECALL_DETECTION_SYSTEM
 
+CANONICALIZE_MAX_DIST = 0.35  # cosine distance; above this we keep the LLM name as-is
+
 
 class GroceryItem(BaseModel):
     name_en: str
@@ -36,11 +38,18 @@ def _canonicalize(items: List[GroceryItem]) -> List[GroceryItem]:
     for item in items:
         try:
             hits = search_pantry(item.name_en, n=1)
-            if hits and hits[0]["distance"] < 0.6:  # cosine: lower = closer
-                canonical = hits[0].get("name_en", item.name_en)
-                if canonical != item.name_en:
-                    logger.debug(f"Canonicalized {item.name_en!r} -> {canonical!r} (dist={hits[0]['distance']:.3f})")
-                item = item.model_copy(update={"name_en": canonical})
+            if hits:
+                dist = hits[0]["distance"]
+                if dist < CANONICALIZE_MAX_DIST:
+                    canonical = hits[0].get("name_en", item.name_en)
+                    if canonical != item.name_en:
+                        logger.debug(f"Canonicalized {item.name_en!r} -> {canonical!r} (dist={dist:.3f})")
+                    item = item.model_copy(update={"name_en": canonical})
+                else:
+                    logger.warning(
+                        f"No close pantry match for {item.name_en!r} "
+                        f"(best: {hits[0].get('name_en')!r} dist={dist:.3f}) — keeping original"
+                    )
         except Exception as e:
             logger.warning(f"Pantry lookup failed for {item.name_en!r}: {e}")
         out.append(item)
