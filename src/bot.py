@@ -217,13 +217,16 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     session = _sessions.get(settings.MOM_ID, {})
 
     if session.get("awaiting_confirm"):
-        tl = text.lower()
+        tl = text.lower().strip()
         if any(w in tl for w in ["yes", "haan", "ha", "ok", "send", "bhejo"]):
             await _confirm_and_push(update, context, session)
-        elif any(w in tl for w in ["no", "nahi", "cancel"]):
+        elif tl in {"no", "nahi", "cancel", "ruk"}:
+            # bare cancel word — drop the draft
             _sessions.pop(settings.MOM_ID, None)
             await update.message.reply_text("Order cancel ho gaya.")
         else:
+            # anything else (including "no, i said..." corrections) → re-parse
+            await update.message.reply_text("Theek hai, naya list bana raha hoon...")
             await _parse_and_reply(update, text)
         return
 
