@@ -57,6 +57,24 @@ def search_pantry(query: str, n: int = 3) -> list[dict]:
     return hits
 
 
+def search_pantry_by_category(query: str, category: str, n: int = 5) -> list[dict]:
+    """Like search_pantry but filtered to a specific category."""
+    try:
+        results = get_pantry().query(
+            query_texts=[query],
+            n_results=n,
+            where={"category": {"$eq": category}},
+        )
+    except Exception:
+        # fallback: no category filter (e.g. empty collection for that category)
+        return search_pantry(query, n)
+    hits = []
+    if results["metadatas"]:
+        for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
+            hits.append({**meta, "distance": dist})
+    return hits
+
+
 async def record_order(user_id: int, items: list) -> None:
     try:
         from src.agent import GroceryItem  # local import avoids circular

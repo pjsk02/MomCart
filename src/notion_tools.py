@@ -259,6 +259,189 @@ async def remove_cart_item(cart_id: str, item_name: str) -> bool:
         raise
 
 
+# ── wishlist operations ────────────────────────────────────────────────────────
+
+def _unwrap_pages(result) -> list:
+    """Normalise MCP result to a list of page dicts."""
+    pages = result if isinstance(result, list) else result.get("results", [])
+    if pages and isinstance(pages[0], dict) and "text" in pages[0]:
+        try:
+            data = json.loads(pages[0]["text"])
+            pages = data.get("results", [])
+        except json.JSONDecodeError:
+            pass
+    return pages
+
+
+async def add_to_wishlist(item_name: str, qty: float, unit: str, order_id: str) -> None:
+    """Add item to wishlist, accumulating qty if it already exists."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+    create = _require(tools, "API-post-page")
+    patch = _require(tools, "API-patch-page")
+
+    # check for existing wishlist row for this item
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {
+                "and": [
+                    {"property": "Status", "select": {"equals": "wishlist"}},
+                    {"property": "Item", "title": {"equals": item_name}},
+                ]
+            },
+        })
+        existing = _unwrap_pages(result)
+    except Exception as e:
+        logger.error(f"wishlist query failed for {item_name!r}: {e}")
+        existing = []
+
+    if existing:
+        page_id = existing[0].get("id") if isinstance(existing[0], dict) else None
+        if page_id:
+            # accumulate qty
+            old_qty = (existing[0].get("properties", {}).get("Qty", {}).get("number") or 0)
+            new_qty = old_qty + qty
+            try:
+                await patch.ainvoke({
+                    "page_id": page_id,
+                    "properties": {"Qty": {"number": new_qty}},
+                })
+                logger.info(f"Wishlist {item_name!r} qty updated {old_qty} -> {new_qty}")
+            except Exception as e:
+                logger.error(f"wishlist qty update failed: {e}")
+            return
+
+    # create new wishlist row
+    payload = {
+        "parent": {"database_id": settings.NOTION_DATABASE_ID},
+        "properties": {
+            "Item": {"title": [{"text": {"content": item_name}}]},
+            "Qty": {"number": qty},
+            "Unit": {"select": {"name": unit}},
+            "Status": {"select": {"name": "wishlist"}},
+            "OrderID": {"rich_text": [{"text": {"content": order_id}}]},
+        },
+    }
+    try:
+        result = await create.ainvoke(payload)
+        _raise_if_error(result, f"add_to_wishlist {item_name!r}")
+        logger.info(f"Wishlist row created: {item_name!r} (order {order_id})")
+    except Exception as e:
+        logger.error(f"add_to_wishlist failed for {item_name!r}: {e}")
+        raise
+
+
+async def get_wishlist_items() -> list[dict]:
+    """Return all Status='wishlist' page dicts."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {"property": "Status", "select": {"equals": "wishlist"}},
+        })
+        return _unwrap_pages(result)
+    except Exception as e:
+        logger.error(f"get_wishlist_items failed: {e}")
+        raise
+
+
+async def remove_wishlist_item(item_name: str) -> bool:
+    """Archive the first wishlist row matching item_name. Returns True if found."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+    patch = _require(tools, "API-patch-page")
+
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {
+                "and": [
+                    {"property": "Status", "select": {"equals": "wishlist"}},
+                    {"property": "Item", "title": {"equals": item_name}},
+                ]
+            },
+        })
+        pages = _unwrap_pages(result)
+    except Exception as e:
+        logger.error(f"remove_wishlist_item query failed: {e}")
+        raise
+
+    if not pages:
+        return False
+
+    page_id = pages[0].get("id") if isinstance(pages[0], dict) else None
+    if not page_id:
+        return False
+
+    await patch.ainvoke({"page_id": page_id, "archived": True})
+    logger.info(f"Removed wishlist item {item_name!r}")
+    return True
+
+
+async def clear_wishlist() -> int:
+    """Archive all wishlist rows. Returns count."""
+    tools = await _get_tools()
+    patch = _require(tools, "API-patch-page")
+
+    pages = await get_wishlist_items()
+    count = 0
+    for page in pages:
+        page_id = page.get("id") if isinstance(page, dict) else None
+        if not page_id:
+            continue
+        try:
+            await patch.ainvoke({"page_id": page_id, "archived": True})
+            count += 1
+        except Exception as e:
+            logger.error(f"clear_wishlist archive failed for {page_id}: {e}")
+
+    logger.info(f"Cleared {count} wishlist rows")
+    return count
+
+
+async def delete_wishlist_for_order_item(order_id: str, item_name: str) -> None:
+    """Delete wishlist row matching order_id + item_name (for ❌ -> ✅ flip-back)."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+    patch = _require(tools, "API-patch-page")
+
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {
+                "and": [
+                    {"property": "Status", "select": {"equals": "wishlist"}},
+                    {"property": "OrderID", "rich_text": {"equals": order_id}},
+                    {"property": "Item", "title": {"equals": item_name}},
+                ]
+            },
+        })
+        pages = _unwrap_pages(result)
+    except Exception as e:
+        logger.warning(f"delete_wishlist_for_order_item query failed: {e}")
+        return
+
+    for page in pages:
+        page_id = page.get("id") if isinstance(page, dict) else None
+        if page_id:
+            try:
+                await patch.ainvoke({"page_id": page_id, "archived": True})
+                logger.info(f"Deleted wishlist row for {item_name!r} order {order_id}")
+            except Exception as e:
+                logger.warning(f"delete_wishlist_for_order_item archive failed: {e}")
+
+
 # ── legacy push (kept for shopkeeper flow compatibility) ─────────────────────
 
 async def push_order(items: List) -> str:
