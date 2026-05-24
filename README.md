@@ -279,3 +279,12 @@ GEMMA_MODEL=gemma4:e4b
 WHISPER_MODEL=large-v3
 WHISPER_DEVICE=cpu    # or cuda
 ```
+
+---
+
+## Demo
+
+https://github.com/user-attachments/assets/00fd0e94-b0b3-4bcb-8c7e-90f7e7d1cf31
+
+```
+
