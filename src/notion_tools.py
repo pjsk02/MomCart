@@ -141,21 +141,87 @@ async def update_item_status(order_id: str, item_name: str, status: str) -> None
         return
 
     page_id = pages[0]["id"] if isinstance(pages[0], dict) else pages[0].id
+
+    # ── DIAGNOSTIC 1: log exact args being sent to API-patch-page ────────────
+    patch_args = {
+        "page_id": page_id,
+        "properties": {
+            "Status": {"select": {"name": status}}
+        },
+    }
+    logger.info(f"[DIAG] Calling API-patch-page with args:\n{json.dumps(patch_args, indent=2)}")
+
     errors = 0
     try:
-        await patch.ainvoke({
-            "page_id": page_id,
-            "properties": {
-                "Status": {"select": {"name": status}}
-            },
-        })
-        logger.info(f"Updated {item_name!r} -> {status} (order {order_id})")
+        patch_result = await patch.ainvoke(patch_args)
+
+        # ── DIAGNOSTIC 2: log full raw response ──────────────────────────────
+        logger.info(f"[DIAG] API-patch-page raw response:\n{json.dumps(patch_result, indent=2, default=str)}")
+
     except Exception as e:
         errors += 1
         logger.error(f"Notion patch failed for {item_name!r}: {e}")
         if errors >= 2:
             raise RuntimeError(f"Notion update aborted after 2 errors. Last: {e}")
         raise
+
+    # ── DIAGNOSTIC 3: re-fetch the page and log current Status value ─────────
+    try:
+        retrieve = tools.get("API-retrieve-a-page")
+        if retrieve:
+            fetch_result = await retrieve.ainvoke({"page_id": page_id})
+            logger.info(f"[DIAG] API-retrieve-a-page raw response:\n{json.dumps(fetch_result, indent=2, default=str)}")
+            # parse Status out of the response for a quick readable summary
+            if isinstance(fetch_result, list):
+                for block in fetch_result:
+                    if isinstance(block, dict) and "text" in block:
+                        try:
+                            page_data = json.loads(block["text"])
+                            current_status = (
+                                page_data.get("properties", {})
+                                .get("Status", {})
+                                .get("select", {})
+                                or {}
+                            ).get("name", "<not found>")
+                            logger.info(f"[DIAG] Status on page after patch: {current_status!r}")
+                        except json.JSONDecodeError:
+                            logger.info(f"[DIAG] Could not parse page response: {block['text'][:200]}")
+        else:
+            logger.warning("[DIAG] API-retrieve-a-page tool not available — skipping re-fetch")
+    except Exception as e:
+        logger.warning(f"[DIAG] Re-fetch failed: {e}")
+
+    logger.info(f"Updated {item_name!r} -> {status} (order {order_id})")
+
+
+async def get_item_status(order_id: str, item_name: str) -> str | None:
+    """Return the current Notion Status value for a single item, or None if not found."""
+    from src.config import settings
+
+    tools = await _get_tools()
+    query = _require(tools, "API-query-data-source")
+
+    try:
+        result = await query.ainvoke({
+            "data_source_id": settings.NOTION_DATABASE_ID,
+            "filter": {
+                "and": [
+                    {"property": "OrderID", "rich_text": {"equals": order_id}},
+                    {"property": "Item", "title": {"equals": item_name}},
+                ]
+            },
+        })
+    except Exception as e:
+        logger.error(f"Notion query failed (get_item_status order={order_id}, item={item_name!r}): {e}")
+        raise
+
+    pages = result if isinstance(result, list) else result.get("results", [])
+    if not pages:
+        return None
+
+    props = pages[0].get("properties", {}) if isinstance(pages[0], dict) else {}
+    select = (props.get("Status", {}).get("select") or {})
+    return select.get("name")
 
 
 async def get_order_summary(order_id: str) -> dict[str, int]:
