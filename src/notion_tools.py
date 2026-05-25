@@ -10,6 +10,58 @@ if TYPE_CHECKING:
     from src.agent import GroceryItem
 
 _tools: dict | None = None
+_data_source_id: str | None = None
+
+
+async def _get_data_source_id() -> str:
+    """Retrieve and cache the data_source_id for the configured Notion database.
+
+    API-query-data-source requires a data_source_id, not the raw database UUID.
+    We call API-retrieve-a-database once and extract the first data source id.
+    """
+    global _data_source_id
+    if _data_source_id is not None:
+        return _data_source_id
+
+    from src.config import settings
+    tools = await _get_tools()
+    retrieve_db = _require(tools, "API-retrieve-a-database")
+
+    try:
+        result = await retrieve_db.ainvoke({"database_id": settings.NOTION_DATABASE_ID})
+    except Exception as e:
+        logger.error(f"API-retrieve-a-database failed: {e}")
+        raise
+
+    # MCP wraps response in a text block
+    data: dict = {}
+    if isinstance(result, list):
+        for block in result:
+            if isinstance(block, dict) and "text" in block:
+                try:
+                    data = json.loads(block["text"])
+                    break
+                except json.JSONDecodeError:
+                    pass
+    elif isinstance(result, dict):
+        data = result
+
+    # Extract the first data source id
+    sources = data.get("data_sources") or []
+    if sources and isinstance(sources, list):
+        _data_source_id = sources[0].get("id") or sources[0].get("data_source_id")
+
+    if not _data_source_id:
+        # Fallback: some versions return it directly on the database object
+        _data_source_id = data.get("data_source_id") or data.get("id")
+
+    if not _data_source_id:
+        logger.error(f"Could not extract data_source_id from database response. Keys: {list(data.keys())}")
+        logger.error(f"Full response: {json.dumps(data, indent=2, default=str)[:1000]}")
+        raise RuntimeError("Could not resolve data_source_id from Notion database")
+
+    logger.info(f"Resolved data_source_id={_data_source_id!r} for database {settings.NOTION_DATABASE_ID!r}")
+    return _data_source_id
 
 
 def _raise_if_error(result, context: str = "") -> None:
@@ -139,7 +191,7 @@ async def get_cart_items(cart_id: str) -> list[dict]:
     logger.info(f"[DIAG get_cart_items] MCP tool name: {query.name!r}")
 
     query_args = {
-        "data_source_id": settings.NOTION_DATABASE_ID,
+        "data_source_id": await _get_data_source_id(),
         "filter": {
             "and": [
                 {"property": "OrderID", "rich_text": {"equals": cart_id}},
@@ -234,7 +286,7 @@ async def remove_cart_item(cart_id: str, item_name: str) -> bool:
 
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": cart_id}},
@@ -308,7 +360,7 @@ async def add_to_wishlist(item_name: str, qty: float, unit: str, order_id: str) 
     # check for existing wishlist row for this item
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"equals": "wishlist"}},
@@ -366,7 +418,7 @@ async def get_wishlist_items() -> list[dict]:
 
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {"property": "Status", "select": {"equals": "wishlist"}},
         })
         return _unwrap_pages(result)
@@ -385,7 +437,7 @@ async def remove_wishlist_item(item_name: str) -> bool:
 
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"equals": "wishlist"}},
@@ -441,7 +493,7 @@ async def delete_wishlist_for_order_item(order_id: str, item_name: str) -> None:
 
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"equals": "wishlist"}},
@@ -516,7 +568,7 @@ async def update_item_status(order_id: str, item_name: str, status: str) -> None
     # Find the page for this order + item
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": order_id}},
@@ -528,7 +580,7 @@ async def update_item_status(order_id: str, item_name: str, status: str) -> None
         logger.error(f"Notion query failed (order={order_id}, item={item_name!r}): {e}")
         raise
 
-    pages = result if isinstance(result, list) else result.get("results", [])
+    pages = _unwrap_pages(result)
     if not pages:
         logger.warning(f"No Notion page found for order={order_id} item={item_name!r}")
         return
@@ -596,7 +648,7 @@ async def get_item_status(order_id: str, item_name: str) -> str | None:
 
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": order_id}},
@@ -608,7 +660,7 @@ async def get_item_status(order_id: str, item_name: str) -> str | None:
         logger.error(f"Notion query failed (get_item_status order={order_id}, item={item_name!r}): {e}")
         raise
 
-    pages = result if isinstance(result, list) else result.get("results", [])
+    pages = _unwrap_pages(result)
     if not pages:
         return None
 
@@ -625,7 +677,7 @@ async def get_order_summary(order_id: str) -> dict[str, int]:
 
     try:
         result = await query.ainvoke({
-            "data_source_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "property": "OrderID",
                 "rich_text": {"equals": order_id},
@@ -635,7 +687,7 @@ async def get_order_summary(order_id: str) -> dict[str, int]:
         logger.error(f"Notion query failed for order summary {order_id}: {e}")
         raise
 
-    pages = result if isinstance(result, list) else result.get("results", [])
+    pages = _unwrap_pages(result)
     counts: dict[str, int] = {"packed": 0, "partial": 0, "out": 0, "pending": 0}
     for page in pages:
         props = page.get("properties", {}) if isinstance(page, dict) else {}

@@ -395,14 +395,14 @@ async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        from src.notion_tools import get_order_summary, _get_tools, _require
+        from src.notion_tools import get_order_summary, _get_tools, _require, _get_data_source_id
         from src.config import settings as cfg
         import json as _json
 
         tools = await _get_tools()
         query = _require(tools, "API-query-data-source")
         result = await query.ainvoke({
-            "data_source_id": cfg.NOTION_DATABASE_ID,
+            "data_source_id": await _get_data_source_id(),
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": order_id}},
