@@ -124,7 +124,8 @@ async def _get_tools() -> dict:
         raise
 
     _tools = {t.name: t for t in tool_list}
-    logger.info(f"Notion MCP connected — {len(_tools)} tools available: {sorted(_tools)}")
+    logger.info(f"Notion MCP connected — {len(_tools)} tools available")
+    logger.info(f"MCP tool names: {sorted([t.name for t in tool_list])}")
     return _tools
 
 
