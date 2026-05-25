@@ -58,7 +58,7 @@ async def _get_tools() -> dict:
         raise
 
     _tools = {t.name: t for t in tool_list}
-    logger.info(f"Notion MCP connected — {len(_tools)} tools available: {sorted(_tools)}")
+    logger.info(f"Notion MCP connected — {len(_tools)} tools available")
     return _tools
 
 
@@ -133,13 +133,13 @@ async def get_cart_items(cart_id: str) -> list[dict]:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
 
     # ── DIAG 2: tool name ────────────────────────────────────────────────────
     logger.info(f"[DIAG get_cart_items] MCP tool name: {query.name!r}")
 
     query_args = {
-        "database_id": settings.NOTION_DATABASE_ID,
+        "data_source_id": settings.NOTION_DATABASE_ID,
         "filter": {
             "and": [
                 {"property": "OrderID", "rich_text": {"equals": cart_id}},
@@ -229,12 +229,12 @@ async def remove_cart_item(cart_id: str, item_name: str) -> bool:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
     patch = _require(tools, "API-patch-page")
 
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": cart_id}},
@@ -301,14 +301,14 @@ async def add_to_wishlist(item_name: str, qty: float, unit: str, order_id: str) 
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
     create = _require(tools, "API-post-page")
     patch = _require(tools, "API-patch-page")
 
     # check for existing wishlist row for this item
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"equals": "wishlist"}},
@@ -362,11 +362,11 @@ async def get_wishlist_items() -> list[dict]:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
 
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {"property": "Status", "select": {"equals": "wishlist"}},
         })
         return _unwrap_pages(result)
@@ -380,12 +380,12 @@ async def remove_wishlist_item(item_name: str) -> bool:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
     patch = _require(tools, "API-patch-page")
 
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"equals": "wishlist"}},
@@ -436,12 +436,12 @@ async def delete_wishlist_for_order_item(order_id: str, item_name: str) -> None:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
     patch = _require(tools, "API-patch-page")
 
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "Status", "select": {"equals": "wishlist"}},
@@ -510,13 +510,13 @@ async def update_item_status(order_id: str, item_name: str, status: str) -> None
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
     patch = _require(tools, "API-patch-page")
 
     # Find the page for this order + item
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": order_id}},
@@ -592,11 +592,11 @@ async def get_item_status(order_id: str, item_name: str) -> str | None:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
 
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": order_id}},
@@ -621,11 +621,11 @@ async def get_order_summary(order_id: str) -> dict[str, int]:
     from src.config import settings
 
     tools = await _get_tools()
-    query = _require(tools, "API-post-database-query")
+    query = _require(tools, "API-query-data-source")
 
     try:
         result = await query.ainvoke({
-            "database_id": settings.NOTION_DATABASE_ID,
+            "data_source_id": settings.NOTION_DATABASE_ID,
             "filter": {
                 "property": "OrderID",
                 "rich_text": {"equals": order_id},
