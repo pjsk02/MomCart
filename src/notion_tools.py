@@ -13,11 +13,26 @@ _tools: dict | None = None
 _data_source_id: str | None = None
 
 
-async def _get_data_source_id() -> str:
-    """Retrieve and cache the data_source_id for the configured Notion database.
+def _parse_mcp_text_block(result) -> dict:
+    """Extract the JSON payload from an MCP text-block response."""
+    if isinstance(result, list):
+        for block in result:
+            if isinstance(block, dict) and "text" in block:
+                try:
+                    return json.loads(block["text"])
+                except json.JSONDecodeError:
+                    pass
+    elif isinstance(result, dict):
+        return result
+    return {}
 
-    API-query-data-source requires a data_source_id, not the raw database UUID.
-    We call API-retrieve-a-database once and extract the first data source id.
+
+async def _get_data_source_id() -> str:
+    """Resolve and cache the data_source_id needed by API-query-data-source.
+
+    Tries API-retrieve-a-data-source first (passing the database UUID directly),
+    then falls back to API-retrieve-a-database and walking its response.
+    Logs full responses so mismatches are immediately visible.
     """
     global _data_source_id
     if _data_source_id is not None:
@@ -25,57 +40,49 @@ async def _get_data_source_id() -> str:
 
     from src.config import settings
     tools = await _get_tools()
-    retrieve_db = _require(tools, "API-retrieve-a-database")
 
+    # ── Path 1: API-retrieve-a-data-source(database UUID) ────────────────────
+    retrieve_ds = tools.get("API-retrieve-a-data-source")
+    if retrieve_ds:
+        try:
+            result = await retrieve_ds.ainvoke({"data_source_id": settings.NOTION_DATABASE_ID})
+            data = _parse_mcp_text_block(result)
+            logger.info(f"[DIAG] API-retrieve-a-data-source response keys: {list(data.keys())}")
+            logger.info(f"[DIAG] API-retrieve-a-data-source full:\n{json.dumps(data, indent=2, default=str)}")
+            candidate = data.get("id") or data.get("data_source_id")
+            if candidate and '"status":4' not in json.dumps(data):
+                _data_source_id = candidate
+                logger.info(f"data_source_id resolved via API-retrieve-a-data-source: {_data_source_id!r}")
+                return _data_source_id
+        except Exception as e:
+            logger.warning(f"API-retrieve-a-data-source failed: {e}")
+
+    # ── Path 2: API-retrieve-a-database → walk for data source id ────────────
+    retrieve_db = _require(tools, "API-retrieve-a-database")
     try:
         result = await retrieve_db.ainvoke({"database_id": settings.NOTION_DATABASE_ID})
+        data = _parse_mcp_text_block(result)
+        logger.info(f"[DIAG] API-retrieve-a-database response keys: {list(data.keys())}")
+        logger.info(f"[DIAG] API-retrieve-a-database full:\n{json.dumps(data, indent=2, default=str)}")
+
+        sources = data.get("data_sources") or []
+        if sources and isinstance(sources, list):
+            _data_source_id = sources[0].get("id") or sources[0].get("data_source_id")
+        if not _data_source_id:
+            _data_source_id = data.get("data_source_id")
+
+        if _data_source_id:
+            logger.info(f"data_source_id resolved via API-retrieve-a-database: {_data_source_id!r}")
+            logger.info(f"same as database UUID? {_data_source_id == settings.NOTION_DATABASE_ID}")
+            return _data_source_id
     except Exception as e:
         logger.error(f"API-retrieve-a-database failed: {e}")
-        raise
 
-    # ── DIAG: log raw MCP response ───────────────────────────────────────────
-    logger.info(f"[DIAG _get_data_source_id] raw result type: {type(result).__name__}, len={len(result) if isinstance(result, (list, dict)) else 'n/a'}")
-    logger.info(f"[DIAG _get_data_source_id] raw result:\n{json.dumps(result, indent=2, default=str)}")
-
-    # MCP wraps response in a text block
-    data: dict = {}
-    if isinstance(result, list):
-        for block in result:
-            if isinstance(block, dict) and "text" in block:
-                try:
-                    data = json.loads(block["text"])
-                    break
-                except json.JSONDecodeError:
-                    pass
-    elif isinstance(result, dict):
-        data = result
-
-    # ── DIAG: log parsed data and the key walk ───────────────────────────────
-    logger.info(f"[DIAG _get_data_source_id] parsed data top-level keys: {list(data.keys())}")
-    logger.info(f"[DIAG _get_data_source_id] data['data_sources'] = {data.get('data_sources')!r}")
-    logger.info(f"[DIAG _get_data_source_id] data['id'] = {data.get('id')!r}")
-    logger.info(f"[DIAG _get_data_source_id] data['data_source_id'] = {data.get('data_source_id')!r}")
-
-    # Extract the first data source id
-    sources = data.get("data_sources") or []
-    if sources and isinstance(sources, list):
-        _data_source_id = sources[0].get("id") or sources[0].get("data_source_id")
-
-    if not _data_source_id:
-        # Fallback: some versions return it directly on the database object
-        _data_source_id = data.get("data_source_id") or data.get("id")
-
-    # ── DIAG: side-by-side comparison ────────────────────────────────────────
-    logger.info(f"[DIAG _get_data_source_id] NOTION_DATABASE_ID = {settings.NOTION_DATABASE_ID!r}")
-    logger.info(f"[DIAG _get_data_source_id] extracted _data_source_id = {_data_source_id!r}")
-    logger.info(f"[DIAG _get_data_source_id] same as database UUID? {_data_source_id == settings.NOTION_DATABASE_ID}")
-
-    if not _data_source_id:
-        logger.error(f"[DIAG _get_data_source_id] full data dump:\n{json.dumps(data, indent=2, default=str)}")
-        raise RuntimeError("Could not resolve data_source_id from Notion database")
-
-    logger.info(f"Resolved data_source_id={_data_source_id!r} for database {settings.NOTION_DATABASE_ID!r}")
-    return _data_source_id
+    logger.error(
+        f"Could not resolve data_source_id. NOTION_DATABASE_ID={settings.NOTION_DATABASE_ID!r}. "
+        f"Tried API-retrieve-a-data-source and API-retrieve-a-database."
+    )
+    raise RuntimeError("Could not resolve data_source_id from Notion")
 
 
 def _raise_if_error(result, context: str = "") -> None:
