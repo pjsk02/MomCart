@@ -400,9 +400,9 @@ async def _handle_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         import json as _json
 
         tools = await _get_tools()
-        query = _require(tools, "API-query-data-source")
+        query = _require(tools, "API-post-database-query")
         result = await query.ainvoke({
-            "data_source_id": cfg.NOTION_DATABASE_ID,
+            "database_id": cfg.NOTION_DATABASE_ID,
             "filter": {
                 "and": [
                     {"property": "OrderID", "rich_text": {"equals": order_id}},
