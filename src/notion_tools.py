@@ -33,6 +33,10 @@ async def _get_data_source_id() -> str:
         logger.error(f"API-retrieve-a-database failed: {e}")
         raise
 
+    # ── DIAG: log raw MCP response ───────────────────────────────────────────
+    logger.info(f"[DIAG _get_data_source_id] raw result type: {type(result).__name__}, len={len(result) if isinstance(result, (list, dict)) else 'n/a'}")
+    logger.info(f"[DIAG _get_data_source_id] raw result:\n{json.dumps(result, indent=2, default=str)}")
+
     # MCP wraps response in a text block
     data: dict = {}
     if isinstance(result, list):
@@ -46,6 +50,12 @@ async def _get_data_source_id() -> str:
     elif isinstance(result, dict):
         data = result
 
+    # ── DIAG: log parsed data and the key walk ───────────────────────────────
+    logger.info(f"[DIAG _get_data_source_id] parsed data top-level keys: {list(data.keys())}")
+    logger.info(f"[DIAG _get_data_source_id] data['data_sources'] = {data.get('data_sources')!r}")
+    logger.info(f"[DIAG _get_data_source_id] data['id'] = {data.get('id')!r}")
+    logger.info(f"[DIAG _get_data_source_id] data['data_source_id'] = {data.get('data_source_id')!r}")
+
     # Extract the first data source id
     sources = data.get("data_sources") or []
     if sources and isinstance(sources, list):
@@ -55,9 +65,13 @@ async def _get_data_source_id() -> str:
         # Fallback: some versions return it directly on the database object
         _data_source_id = data.get("data_source_id") or data.get("id")
 
+    # ── DIAG: side-by-side comparison ────────────────────────────────────────
+    logger.info(f"[DIAG _get_data_source_id] NOTION_DATABASE_ID = {settings.NOTION_DATABASE_ID!r}")
+    logger.info(f"[DIAG _get_data_source_id] extracted _data_source_id = {_data_source_id!r}")
+    logger.info(f"[DIAG _get_data_source_id] same as database UUID? {_data_source_id == settings.NOTION_DATABASE_ID}")
+
     if not _data_source_id:
-        logger.error(f"Could not extract data_source_id from database response. Keys: {list(data.keys())}")
-        logger.error(f"Full response: {json.dumps(data, indent=2, default=str)[:1000]}")
+        logger.error(f"[DIAG _get_data_source_id] full data dump:\n{json.dumps(data, indent=2, default=str)}")
         raise RuntimeError("Could not resolve data_source_id from Notion database")
 
     logger.info(f"Resolved data_source_id={_data_source_id!r} for database {settings.NOTION_DATABASE_ID!r}")
